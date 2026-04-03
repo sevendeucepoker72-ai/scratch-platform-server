@@ -26,6 +26,10 @@ export const distributionRouter = Router();
 
 const APP_URL = process.env.APP_URL ?? 'http://localhost:5173';
 
+function getClientIp(req: Request): string {
+  return (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? 'unknown';
+}
+
 // ── POST /issue-batch — Create N distribution tickets (admin+) ──
 
 distributionRouter.post(
@@ -296,6 +300,15 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
       throw new HttpError(400, `Ticket is already ${ticket.status}.`);
     }
 
+    // IP lock: bind ticket to first player's IP
+    const clientIp = getClientIp(req);
+    if (ticket.lockedIp && ticket.lockedIp !== clientIp) {
+      throw new HttpError(403, 'This ticket is already in use by another player.');
+    }
+    if (!ticket.lockedIp) {
+      await prisma.ticket.update({ where: { id: validId }, data: { lockedIp: clientIp } });
+    }
+
     const deck = (typeof ticket.deck === 'string' ? JSON.parse(ticket.deck) : ticket.deck) as string[];
     const revealedCardIds = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
 
@@ -406,6 +419,13 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
     if (!ticket) throw new HttpError(404, 'Ticket not found.');
     if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
     if (ticket.isFrozen) throw new HttpError(403, 'Ticket is frozen.');
+
+    // IP lock check
+    const clientIp = getClientIp(req);
+    if (ticket.lockedIp && ticket.lockedIp !== clientIp) {
+      throw new HttpError(403, 'This ticket is already in use by another player.');
+    }
+
     if (ticket.status === 'finalized' || ticket.status === 'claimed') {
       throw new HttpError(400, `Ticket is already ${ticket.status}.`);
     }
