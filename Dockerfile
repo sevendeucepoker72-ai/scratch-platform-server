@@ -1,10 +1,13 @@
 FROM node:20-slim
 
+# Install OpenSSL for Prisma
+RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Install dependencies
 COPY package.json package-lock.json* ./
-RUN npm install --production=false
+RUN npm install
 
 # Copy source
 COPY . .
@@ -15,14 +18,10 @@ RUN npx prisma generate
 # Create data directory for SQLite
 RUN mkdir -p /data
 
-# Build TypeScript (skip for now — using tsx in production for simplicity)
-# RUN npm run build
-
 ENV NODE_ENV=production
 ENV DATABASE_URL="file:/data/prod.db"
-ENV PORT=3001
 
-EXPOSE 3001
+EXPOSE ${PORT:-3001}
 
-# Push schema and start
-CMD npx prisma db push --skip-generate && npx tsx src/seed-admin.ts; npx tsx src/index.ts
+# Push schema and start server
+CMD sh -c "npx prisma db push --skip-generate && node --import tsx src/index.ts"
