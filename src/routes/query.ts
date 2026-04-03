@@ -213,6 +213,17 @@ queryRouter.get('/campaigns', requireAuth, async (req, res) => {
   }
 });
 
+queryRouter.get('/campaigns/:id', requireAuth, async (req, res) => {
+  try {
+    const campaign = await prisma.campaign.findUnique({ where: { id: req.params.id } });
+    if (!campaign) throw new HttpError(404, 'Campaign not found.');
+    res.json({ ...campaign, campaignId: campaign.id });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── Odds Profiles ────────────────────────────────────────────
 
 queryRouter.get('/odds-profiles', requireAuth, async (req, res) => {
@@ -223,6 +234,17 @@ queryRouter.get('/odds-profiles', requireAuth, async (req, res) => {
     const profiles = await prisma.oddsProfile.findMany({ where });
     res.json(profiles.map(p => ({ ...parseJsonFields(p as unknown as Record<string, unknown>), profileId: p.id })));
   } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+queryRouter.get('/odds-profiles/:id', requireAuth, async (req, res) => {
+  try {
+    const profile = await prisma.oddsProfile.findUnique({ where: { id: req.params.id } });
+    if (!profile) throw new HttpError(404, 'Odds profile not found.');
+    res.json({ ...parseJsonFields(profile as unknown as Record<string, unknown>), profileId: profile.id });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
     res.status(500).json({ error: 'Internal server error' });
   }
 });
