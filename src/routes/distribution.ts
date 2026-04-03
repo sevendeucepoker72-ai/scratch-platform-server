@@ -423,7 +423,7 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
     };
     let prizeSnapshot: any;
 
-    if (gameType === 'poker') {
+    if (gameType === 'poker' || gameType === 'poker_pick') {
       const handResult = evaluateBestHand(revealedCardIds);
       prizeSnapshot = buildPrizeSnapshot(handResult, oddsProfile as any);
     } else {

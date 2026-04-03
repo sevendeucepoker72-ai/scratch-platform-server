@@ -142,7 +142,7 @@ playerRouter.post('/issue-ticket', async (req, res) => {
 
     // Game type dispatch: use the right deck builder for this campaign
     const gameType = (campaign.gameType as GameType | null) ?? 'poker';
-    const engine = gameType !== 'poker' ? GAME_ENGINES[gameType] : null;
+    const engine = (gameType !== 'poker' && gameType !== 'poker_pick') ? GAME_ENGINES[gameType] : null;
     const deck = engine ? engine.buildDeck() : buildShuffledDeck();
     const scratchLimitOverride = engine ? engine.scratchLimit : ((odds as any).scratchLimit ?? 7);
 
@@ -287,7 +287,7 @@ playerRouter.post('/reveal', requireAuth, async (req, res) => {
       }
 
       // For poker: validate that the client-supplied cardId matches deck order
-      const isPokerTicket = !ticket.gameType || ticket.gameType === 'poker';
+      const isPokerTicket = !ticket.gameType || ticket.gameType === 'poker' || ticket.gameType === 'poker_pick';
       if (isPokerTicket && rawCardId && rawCardId !== nextDeckItem) {
         await writeFraudEvent({
           ticketId,
@@ -402,7 +402,7 @@ playerRouter.post('/finalize', requireAuth, async (req, res) => {
     const ticketGameType = (ticket.gameType as GameType | null) ?? 'poker';
     let prizeSnapshot: ReturnType<typeof buildPrizeSnapshot>;
 
-    if (ticketGameType !== 'poker' && GAME_ENGINES[ticketGameType]) {
+    if (ticketGameType !== 'poker' && ticketGameType !== 'poker_pick' && GAME_ENGINES[ticketGameType]) {
       const gameResult = GAME_ENGINES[ticketGameType].evaluate(revealedCardIds);
       // Cast odds.prizes to generic shape (tierName = handRank for non-poker)
       const prizesRaw = typeof (odds as any).prizes === 'string' ? JSON.parse((odds as any).prizes) : ((odds as any).prizes ?? []);
