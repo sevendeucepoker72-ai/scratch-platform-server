@@ -113,6 +113,27 @@ orgRouter.post('/campaigns/update', requireAuth, async (req: Request, res: Respo
   }
 });
 
+orgRouter.post('/odds-profiles/create', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId, name, prizes, scratchLimit } = req.body;
+    if (!name || !name.trim()) throw new HttpError(400, 'Profile name required.');
+    const profile = await prisma.oddsProfile.create({
+      data: {
+        orgId: orgId ?? user.orgId,
+        name: name.trim(),
+        prizes: JSON.stringify(prizes ?? []),
+        scratchLimit: scratchLimit ?? 7,
+      },
+    });
+    res.json({ profile, profileId: profile.id });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] odds-profiles/create error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 orgRouter.post('/odds-profiles/update', requireAuth, async (req: Request, res: Response) => {
   try {
     const { profileId, prizes, scratchLimit, name } = req.body;
