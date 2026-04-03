@@ -130,13 +130,31 @@ export interface HandResult {
   description: string;
 }
 
+function cardRankValues(bestCards: string[]): number[] {
+  return bestCards.map(id => {
+    const rank = id.slice(0, -1);
+    return RANK_ORDER.indexOf(rank) + 2;
+  }).sort((a, b) => b - a);
+}
+
+function isBetterHand(a: { handValue: number; bestCards: string[] }, b: { handValue: number; bestCards: string[] }): boolean {
+  if (a.handValue !== b.handValue) return a.handValue > b.handValue;
+  // Same hand rank — compare card values (kicker comparison)
+  const aVals = cardRankValues(a.bestCards);
+  const bVals = cardRankValues(b.bestCards);
+  for (let i = 0; i < aVals.length; i++) {
+    if (aVals[i] !== bVals[i]) return aVals[i] > bVals[i];
+  }
+  return false;
+}
+
 export function evaluateBestHand(cardIds: string[]): HandResult {
   const cards = cardIds.map(parseCard);
   const combos = getCombinations(cards, 5);
   let best: HandResult | null = null;
   for (const combo of combos) {
     const result = evaluate5(combo);
-    if (!best || result.handValue > best.handValue) best = result;
+    if (!best || isBetterHand(result, best)) best = result;
   }
   return best!;
 }
