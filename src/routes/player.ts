@@ -626,10 +626,16 @@ playerRouter.post('/submit-claim', requireAuth, async (req, res) => {
 // Creates a player profile linked to the Better Auth session user.
 // Role is always hardcoded to 'player' — never from client.
 
-playerRouter.post('/register', requireAuth, async (req, res) => {
+playerRouter.post('/register', async (req, res) => {
   try {
-    const uid = req.user!.id;
-    const email = req.user!.email ?? '';
+    // Bootstrap-safe: get auth session directly (no requireAuth needed)
+    const { fromNodeHeaders } = await import('better-auth/node');
+    const { auth } = await import('../auth.js');
+    const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+    if (!session?.user) { res.status(401).json({ error: 'Authentication required.' }); return; }
+
+    const authId = session.user.id;
+    const email = session.user.email ?? '';
     const displayName = ((req.body as { displayName?: string }).displayName ?? '').trim();
 
     if (!displayName || displayName.length < 2) {
@@ -640,7 +646,7 @@ playerRouter.post('/register', requireAuth, async (req, res) => {
     }
 
     // Check if profile already exists
-    const existing = await prisma.appUser.findUnique({ where: { id: uid } });
+    const existing = await prisma.appUser.findUnique({ where: { authId } });
     if (existing) {
       res.json({ success: true });
       return;
@@ -648,26 +654,17 @@ playerRouter.post('/register', requireAuth, async (req, res) => {
 
     await prisma.appUser.create({
       data: {
-        id: uid,
-        authId: req.user!.authId,
+        authId,
         email,
         displayName,
         role: 'player', // always hardcoded -- never from client
-        venueIds: [],
+        venueIds: '[]',
         isActive: true,
       },
     });
 
-    await writeAuditLog({
-      actorUserId: uid,
-      actorRole: 'player',
-      actionType: 'role_changed',
-      targetType: 'user',
-      targetId: uid,
-      details: { event: 'self_registration', email },
-    });
-
-    console.log('[register] Player profile created', { uid, email });
+    // Audit log uses authId since that's the only stable ID at this point
+    console.log('[register] Player profile created', { authId, email });
 
     res.json({ success: true });
   } catch (err) {
