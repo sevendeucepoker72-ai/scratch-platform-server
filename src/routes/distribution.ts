@@ -31,14 +31,15 @@ const APP_URL = process.env.APP_URL ?? 'http://localhost:5173';
 distributionRouter.post(
   '/issue-batch',
   requireAuth,
-  requireRole('admin', 'super_admin'),
+  requireRole('staff', 'admin', 'super_admin'),
   async (req: Request, res: Response) => {
     try {
-      const { campaignId, count } = req.body;
+      const { campaignId, quantity, count, venueId, orgId } = req.body;
       const user = req.user!;
+      const qty = quantity ?? count;
 
-      if (!campaignId || typeof count !== 'number' || count < 1 || count > 500) {
-        throw new HttpError(400, 'campaignId required and count must be 1-500.');
+      if (!campaignId || typeof qty !== 'number' || qty < 1 || qty > 500) {
+        throw new HttpError(400, 'campaignId required and quantity must be 1-500.');
       }
 
       const campaign = await prisma.campaign.findUnique({
@@ -52,7 +53,7 @@ distributionRouter.post(
 
       // Check quota for each ticket
       if (orgId) {
-        for (let i = 0; i < count; i++) {
+        for (let i = 0; i < qty; i++) {
           await checkTicketQuota(orgId);
         }
       }
@@ -63,7 +64,7 @@ distributionRouter.post(
 
       const tickets: Array<{ ticketId: string; scratchUrl: string; claimCode: string }> = [];
 
-      for (let i = 0; i < count; i++) {
+      for (let i = 0; i < qty; i++) {
         const claimCode = generateClaimCode();
         const claimCodeHash = hashClaimCode(claimCode);
 
@@ -104,12 +105,12 @@ distributionRouter.post(
         targetType: 'campaign',
         targetId: campaignId,
         venueId: campaign.venueId,
-        details: { count, campaignId, gameType },
+        details: { quantity: qty, campaignId, gameType },
       });
 
       io.to(`venue:${campaign.venueId}`).emit('distribution:batch-issued', {
         campaignId,
-        count,
+        count: qty,
         issuedBy: user.id,
       });
 
