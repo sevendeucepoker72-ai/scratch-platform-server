@@ -230,7 +230,12 @@ distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) 
     if (existingClaim) throw new HttpError(409, 'A claim has already been submitted for this ticket.');
 
     const prizeSnapshot = typeof ticket.prizeSnapshot === 'string' ? JSON.parse(ticket.prizeSnapshot) : ticket.prizeSnapshot;
-    if (!prizeSnapshot || prizeSnapshot.prizeAmount <= 0) {
+    // Allow claims for item prizes (prizeAmount=0 but prizeLabel is set)
+    const hasWinningPrize = prizeSnapshot && (
+      prizeSnapshot.prizeAmount > 0 ||
+      (prizeSnapshot.prizeLabel && prizeSnapshot.prizeLabel !== 'No prize' && prizeSnapshot.prizeLabel !== prizeSnapshot.handRank)
+    );
+    if (!hasWinningPrize) {
       throw new HttpError(400, 'This ticket has no prize to claim.');
     }
 
