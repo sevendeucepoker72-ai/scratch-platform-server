@@ -1,0 +1,441 @@
+import { Router, Request, Response } from 'express';
+import * as crypto from 'crypto';
+import { requireAuth, requireRole } from '../middleware/auth.js';
+import { prisma } from '../db.js';
+import { io } from '../index.js';
+import {
+  HttpError,
+  writeAuditLog,
+  hashClaimCode,
+  generateClaimCode,
+  validateTicketId,
+  validateCardId,
+  checkTicketQuota,
+  escapeHtml,
+} from '../lib/helpers.js';
+import { checkRateLimit } from '../middleware/rateLimiter.js';
+import { buildShuffledDeck, evaluateBestHand, buildPrizeSnapshot } from '../game/poker.js';
+import {
+  GAME_ENGINES,
+  buildGamePrizeSnapshot,
+  type GameType,
+  type GenericOddsProfile,
+} from '../game/gameEngines.js';
+
+export const distributionRouter = Router();
+
+const APP_URL = process.env.APP_URL ?? 'http://localhost:5173';
+
+// ── POST /issue-batch — Create N distribution tickets (admin+) ──
+
+distributionRouter.post(
+  '/issue-batch',
+  requireAuth,
+  requireRole('admin', 'super_admin'),
+  async (req: Request, res: Response) => {
+    try {
+      const { campaignId, count } = req.body;
+      const user = req.user!;
+
+      if (!campaignId || typeof count !== 'number' || count < 1 || count > 500) {
+        throw new HttpError(400, 'campaignId required and count must be 1-500.');
+      }
+
+      const campaign = await prisma.campaign.findUnique({
+        where: { id: campaignId },
+        include: { oddsProfile: true, venue: true },
+      });
+      if (!campaign) throw new HttpError(404, 'Campaign not found.');
+      if (!campaign.isActive) throw new HttpError(400, 'Campaign is not active.');
+
+      const orgId = campaign.orgId ?? undefined;
+
+      // Check quota for each ticket
+      if (orgId) {
+        for (let i = 0; i < count; i++) {
+          await checkTicketQuota(orgId);
+        }
+      }
+
+      const gameType = (campaign.gameType ?? 'poker') as GameType;
+      const oddsProfile = campaign.oddsProfile;
+      const scratchLimit = oddsProfile.scratchLimit ?? GAME_ENGINES[gameType]?.scratchLimit ?? 7;
+
+      const tickets: Array<{ ticketId: string; scratchUrl: string; claimCode: string }> = [];
+
+      for (let i = 0; i < count; i++) {
+        const claimCode = generateClaimCode();
+        const claimCodeHash = hashClaimCode(claimCode);
+
+        let deck: string[];
+        if (gameType === 'poker') {
+          deck = buildShuffledDeck();
+        } else {
+          const engine = GAME_ENGINES[gameType];
+          if (!engine) throw new HttpError(400, `Unknown game type: ${gameType}`);
+          deck = engine.buildDeck();
+        }
+
+        const ticket = await prisma.ticket.create({
+          data: {
+            venueId: campaign.venueId,
+            campaignId: campaign.id,
+            orgId: orgId ?? null,
+            deck: deck,
+            revealedCardIds: [],
+            scratchLimit,
+            gameType,
+            status: 'issued',
+            claimCodeHash,
+            allowAnonymous: campaign.allowAnonymous,
+            distributionBatch: true,
+            issuedBy: user.id,
+          },
+        });
+
+        const scratchUrl = `${APP_URL}/scratch/${ticket.id}`;
+        tickets.push({ ticketId: ticket.id, scratchUrl, claimCode });
+      }
+
+      await writeAuditLog({
+        actorUserId: user.id,
+        actorRole: user.role,
+        actionType: 'distribution_batch_issued',
+        targetType: 'campaign',
+        targetId: campaignId,
+        venueId: campaign.venueId,
+        details: { count, campaignId, gameType },
+      });
+
+      io.to(`venue:${campaign.venueId}`).emit('distribution:batch-issued', {
+        campaignId,
+        count,
+        issuedBy: user.id,
+      });
+
+      res.json({ tickets });
+    } catch (err) {
+      if (err instanceof HttpError) {
+        res.status(err.status).json({ error: err.message });
+        return;
+      }
+      console.error('[distribution] issue-batch error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
+// ── POST /public-ticket — Get ticket display data (NO AUTH) ──
+
+distributionRouter.post('/public-ticket', async (req: Request, res: Response) => {
+  try {
+    const { ticketId } = req.body;
+    const validId = validateTicketId(ticketId);
+
+    checkRateLimit(`public-ticket:${validId}`, 30);
+
+    const ticket = await prisma.ticket.findUnique({
+      where: { id: validId },
+      include: {
+        campaign: { include: { oddsProfile: true } },
+        venue: true,
+      },
+    });
+
+    if (!ticket) throw new HttpError(404, 'Ticket not found.');
+    if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
+
+    const revealedCardIds = (ticket.revealedCardIds as string[]) ?? [];
+
+    res.json({
+      ticketId: ticket.id,
+      status: ticket.status,
+      gameType: ticket.gameType,
+      scratchLimit: ticket.scratchLimit,
+      revealedCardIds,
+      isFrozen: ticket.isFrozen,
+      freezeReason: ticket.freezeReason,
+      allowAnonymous: ticket.allowAnonymous,
+      prizeSnapshot: ticket.prizeSnapshot,
+      bestHandAtScratch: ticket.bestHandAtScratch,
+      campaign: {
+        id: ticket.campaign.id,
+        name: ticket.campaign.name,
+        description: ticket.campaign.description,
+        gameType: ticket.campaign.gameType,
+        guidelines: ticket.campaign.guidelines,
+        guidelinesRequired: ticket.campaign.guidelinesRequired,
+      },
+      venue: {
+        id: ticket.venue.id,
+        name: ticket.venue.name,
+      },
+      oddsProfile: {
+        prizes: ticket.campaign.oddsProfile.prizes,
+        scratchLimit: ticket.campaign.oddsProfile.scratchLimit,
+      },
+    });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[distribution] public-ticket error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /anonymous-claim — Submit an anonymous claim (NO AUTH) ──
+
+distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) => {
+  try {
+    const { ticketId, claimCode, playerEmail, playerName, playerPhone } = req.body;
+    const validId = validateTicketId(ticketId);
+
+    checkRateLimit(`anon-claim:${validId}`, 5);
+
+    if (!claimCode || typeof claimCode !== 'string') {
+      throw new HttpError(400, 'Claim code is required.');
+    }
+
+    const ticket = await prisma.ticket.findUnique({
+      where: { id: validId },
+      include: { campaign: { include: { oddsProfile: true } } },
+    });
+
+    if (!ticket) throw new HttpError(404, 'Ticket not found.');
+    if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
+    if (!ticket.allowAnonymous) throw new HttpError(403, 'Anonymous claims not allowed for this ticket.');
+    if (ticket.isFrozen) throw new HttpError(403, 'Ticket is frozen.');
+    if (ticket.status !== 'finalized') throw new HttpError(400, 'Ticket must be finalized before claiming.');
+
+    // Verify claim code
+    const expectedHash = ticket.claimCodeHash;
+    const providedHash = hashClaimCode(claimCode.trim().toUpperCase());
+    if (providedHash !== expectedHash) {
+      throw new HttpError(403, 'Invalid claim code.');
+    }
+
+    // Check if claim already exists
+    const existingClaim = await prisma.claim.findUnique({ where: { ticketId: validId } });
+    if (existingClaim) throw new HttpError(409, 'A claim has already been submitted for this ticket.');
+
+    const prizeSnapshot = ticket.prizeSnapshot as any;
+    if (!prizeSnapshot || prizeSnapshot.prizeAmount <= 0) {
+      throw new HttpError(400, 'This ticket has no prize to claim.');
+    }
+
+    const claim = await prisma.claim.create({
+      data: {
+        id: validId,
+        ticketId: validId,
+        playerId: null,
+        venueId: ticket.venueId,
+        campaignId: ticket.campaignId,
+        orgId: ticket.orgId,
+        prizeSnapshot,
+        status: 'pending_staff_approval',
+        isAnonymous: true,
+        playerEmail: playerEmail ?? null,
+        playerName: playerName ?? null,
+        playerPhone: playerPhone ?? null,
+      },
+    });
+
+    await prisma.ticket.update({
+      where: { id: validId },
+      data: {
+        status: 'claimed',
+        claimSubmittedAt: new Date(),
+        anonymousPlayer: {
+          email: playerEmail ?? null,
+          name: playerName ?? null,
+          phone: playerPhone ?? null,
+        },
+      },
+    });
+
+    io.to(`venue:${ticket.venueId}`).emit('claim:submitted', {
+      ticketId: validId,
+      claimId: claim.id,
+      isAnonymous: true,
+    });
+
+    res.json({ claimId: claim.id, status: claim.status });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[distribution] anonymous-claim error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /public-reveal — Reveal a card on a distribution ticket (NO AUTH, deck-order enforced) ──
+
+distributionRouter.post('/public-reveal', async (req: Request, res: Response) => {
+  try {
+    const { ticketId } = req.body;
+    const validId = validateTicketId(ticketId);
+
+    checkRateLimit(`public-reveal:${validId}`, 20);
+
+    const ticket = await prisma.ticket.findUnique({
+      where: { id: validId },
+    });
+
+    if (!ticket) throw new HttpError(404, 'Ticket not found.');
+    if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
+    if (ticket.isFrozen) throw new HttpError(403, 'Ticket is frozen.');
+    if (ticket.status === 'finalized' || ticket.status === 'claimed' || ticket.status === 'expired') {
+      throw new HttpError(400, `Ticket is already ${ticket.status}.`);
+    }
+
+    const deck = ticket.deck as string[];
+    const revealedCardIds = (ticket.revealedCardIds as string[]) ?? [];
+
+    if (revealedCardIds.length >= ticket.scratchLimit) {
+      throw new HttpError(400, 'All cards have been revealed.');
+    }
+
+    // Deck-order enforced: next card is deck[revealedCardIds.length]
+    const nextCard = deck[revealedCardIds.length];
+    if (!nextCard) throw new HttpError(400, 'No more cards to reveal.');
+
+    const newRevealed = [...revealedCardIds, nextCard];
+    const isComplete = newRevealed.length >= ticket.scratchLimit;
+
+    // Update ticket with new reveal
+    const updateData: any = {
+      revealedCardIds: newRevealed,
+      status: ticket.status === 'issued' ? 'in_progress' : ticket.status,
+    };
+
+    // If all cards revealed, compute best hand at scratch
+    if (isComplete) {
+      const gameType = (ticket.gameType ?? 'poker') as GameType;
+      let bestHandAtScratch: any;
+
+      if (gameType === 'poker') {
+        const handResult = evaluateBestHand(newRevealed);
+        bestHandAtScratch = {
+          handRank: handResult.handRank,
+          handValue: handResult.handValue,
+          bestCards: handResult.bestCards,
+          description: handResult.description,
+        };
+      } else {
+        const engine = GAME_ENGINES[gameType];
+        if (engine) {
+          const result = engine.evaluate(newRevealed);
+          bestHandAtScratch = {
+            handRank: result.tierName,
+            handValue: result.tierValue,
+            bestCards: result.displayItems,
+            description: result.description,
+          };
+        }
+      }
+
+      updateData.bestHandAtScratch = bestHandAtScratch ?? null;
+    }
+
+    await prisma.ticket.update({
+      where: { id: validId },
+      data: updateData,
+    });
+
+    io.to(`ticket:${validId}`).emit('card:revealed', {
+      ticketId: validId,
+      cardId: nextCard,
+      revealIndex: newRevealed.length - 1,
+      isComplete,
+    });
+
+    res.json({
+      cardId: nextCard,
+      revealIndex: newRevealed.length - 1,
+      revealedCardIds: newRevealed,
+      isComplete,
+      bestHandAtScratch: isComplete ? updateData.bestHandAtScratch : undefined,
+    });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[distribution] public-reveal error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /public-finalize — Finalize a distribution ticket and evaluate result (NO AUTH) ──
+
+distributionRouter.post('/public-finalize', async (req: Request, res: Response) => {
+  try {
+    const { ticketId } = req.body;
+    const validId = validateTicketId(ticketId);
+
+    checkRateLimit(`public-finalize:${validId}`, 5);
+
+    const ticket = await prisma.ticket.findUnique({
+      where: { id: validId },
+      include: { campaign: { include: { oddsProfile: true } } },
+    });
+
+    if (!ticket) throw new HttpError(404, 'Ticket not found.');
+    if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
+    if (ticket.isFrozen) throw new HttpError(403, 'Ticket is frozen.');
+    if (ticket.status === 'finalized' || ticket.status === 'claimed') {
+      throw new HttpError(400, `Ticket is already ${ticket.status}.`);
+    }
+
+    const revealedCardIds = (ticket.revealedCardIds as string[]) ?? [];
+    if (revealedCardIds.length < ticket.scratchLimit) {
+      throw new HttpError(400, `Must reveal all ${ticket.scratchLimit} cards before finalizing.`);
+    }
+
+    const gameType = (ticket.gameType ?? 'poker') as GameType;
+    const oddsProfile = ticket.campaign.oddsProfile;
+    let prizeSnapshot: any;
+
+    if (gameType === 'poker') {
+      const handResult = evaluateBestHand(revealedCardIds);
+      prizeSnapshot = buildPrizeSnapshot(handResult, oddsProfile as any);
+    } else {
+      const engine = GAME_ENGINES[gameType];
+      if (!engine) throw new HttpError(400, `Unknown game type: ${gameType}`);
+      const result = engine.evaluate(revealedCardIds);
+      prizeSnapshot = buildGamePrizeSnapshot(result, oddsProfile as GenericOddsProfile);
+    }
+
+    await prisma.ticket.update({
+      where: { id: validId },
+      data: {
+        status: 'finalized',
+        prizeSnapshot,
+        finalizedAt: new Date(),
+      },
+    });
+
+    io.to(`ticket:${validId}`).emit('ticket:finalized', {
+      ticketId: validId,
+      prizeSnapshot,
+    });
+
+    io.to(`venue:${ticket.venueId}`).emit('ticket:finalized', {
+      ticketId: validId,
+      prizeSnapshot,
+    });
+
+    res.json({ ticketId: validId, prizeSnapshot });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[distribution] public-finalize error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});

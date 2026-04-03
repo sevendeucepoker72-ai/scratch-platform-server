@@ -1,0 +1,383 @@
+import { Router, Request, Response } from 'express';
+import { requireAuth } from '../middleware/auth.js';
+import { prisma } from '../db.js';
+import { io } from '../index.js';
+import {
+  HttpError,
+  writeAuditLog,
+  validateOrgId,
+  TIER_LIMITS,
+  type SubscriptionTier,
+} from '../lib/helpers.js';
+
+export const orgRouter = Router();
+
+// ── POST /create — Create a new organization ──
+
+orgRouter.post('/create', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { name, slug } = req.body;
+
+    if (!name || typeof name !== 'string' || name.trim().length < 2) {
+      throw new HttpError(400, 'Organization name must be at least 2 characters.');
+    }
+
+    // Validate and normalize slug
+    const normalizedSlug = (slug ?? name)
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+
+    if (normalizedSlug.length < 2 || normalizedSlug.length > 64) {
+      throw new HttpError(400, 'Slug must be 2-64 characters (lowercase letters, numbers, hyphens).');
+    }
+
+    // Check slug uniqueness
+    const existing = await prisma.organization.findUnique({ where: { slug: normalizedSlug } });
+    if (existing) throw new HttpError(409, 'An organization with this slug already exists.');
+
+    // Check if user already owns an org
+    if (user.orgId) {
+      throw new HttpError(400, 'You already belong to an organization.');
+    }
+
+    const org = await prisma.$transaction(async (tx) => {
+      const newOrg = await tx.organization.create({
+        data: {
+          name: name.trim(),
+          slug: normalizedSlug,
+          ownerId: user.id,
+          subscriptionTier: 'starter',
+          subscriptionStatus: 'active',
+        },
+      });
+
+      // Add owner as OrgMember
+      await tx.orgMember.create({
+        data: {
+          orgId: newOrg.id,
+          userId: user.id,
+          email: user.email,
+          displayName: user.displayName,
+          role: 'owner',
+        },
+      });
+
+      // Update user with orgId and orgRole
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          orgId: newOrg.id,
+          orgRole: 'owner',
+          orgName: newOrg.name,
+        },
+      });
+
+      // Create onboarding record
+      await tx.onboarding.create({
+        data: {
+          id: newOrg.id,
+          completedSteps: ['org_created'],
+          currentStep: 'org_created',
+        },
+      });
+
+      return newOrg;
+    });
+
+    await writeAuditLog({
+      actorUserId: user.id,
+      actorRole: user.role,
+      actionType: 'org_created',
+      targetType: 'organization',
+      targetId: org.id,
+      details: { name: org.name, slug: org.slug },
+    });
+
+    res.json({ org });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[org] create error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /update — Update organization details (owner only) ──
+
+orgRouter.post('/update', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId, name, logoUrl, primaryColor } = req.body;
+    const validOrgId = validateOrgId(orgId);
+
+    const org = await prisma.organization.findUnique({ where: { id: validOrgId } });
+    if (!org) throw new HttpError(404, 'Organization not found.');
+    if (org.ownerId !== user.id && user.role !== 'super_admin') {
+      throw new HttpError(403, 'Only the owner can update this organization.');
+    }
+
+    const updateData: Record<string, unknown> = {};
+    if (name !== undefined && typeof name === 'string' && name.trim().length >= 2) {
+      updateData.name = name.trim();
+    }
+    if (logoUrl !== undefined) {
+      updateData.logoUrl = typeof logoUrl === 'string' ? logoUrl : null;
+    }
+    if (primaryColor !== undefined) {
+      updateData.primaryColor = typeof primaryColor === 'string' ? primaryColor : null;
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      throw new HttpError(400, 'No valid fields to update.');
+    }
+
+    const updated = await prisma.organization.update({
+      where: { id: validOrgId },
+      data: updateData,
+    });
+
+    // Update orgName on user records if name changed
+    if (updateData.name) {
+      await prisma.appUser.updateMany({
+        where: { orgId: validOrgId },
+        data: { orgName: updateData.name as string },
+      });
+    }
+
+    await writeAuditLog({
+      actorUserId: user.id,
+      actorRole: user.role,
+      actionType: 'org_updated',
+      targetType: 'organization',
+      targetId: validOrgId,
+      details: updateData as Record<string, unknown>,
+    });
+
+    res.json({ org: updated });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[org] update error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /usage — Get organization usage stats ──
+
+orgRouter.post('/usage', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId } = req.body;
+    const validOrgId = validateOrgId(orgId ?? user.orgId);
+
+    const org = await prisma.organization.findUnique({ where: { id: validOrgId } });
+    if (!org) throw new HttpError(404, 'Organization not found.');
+
+    // Verify membership
+    const member = await prisma.orgMember.findUnique({
+      where: { orgId_userId: { orgId: validOrgId, userId: user.id } },
+    });
+    if (!member && user.role !== 'super_admin') {
+      throw new HttpError(403, 'Not a member of this organization.');
+    }
+
+    const tier = org.subscriptionTier as SubscriptionTier;
+    const limits = TIER_LIMITS[tier] ?? TIER_LIMITS.starter;
+
+    const [memberCount, venueCount, activeCampaignCount] = await Promise.all([
+      prisma.orgMember.count({ where: { orgId: validOrgId } }),
+      prisma.venue.count({ where: { orgId: validOrgId } }),
+      prisma.campaign.count({ where: { orgId: validOrgId, isActive: true } }),
+    ]);
+
+    res.json({
+      orgId: validOrgId,
+      subscriptionTier: tier,
+      subscriptionStatus: org.subscriptionStatus,
+      ticketsIssuedThisMonth: org.ticketsIssuedThisMonth,
+      maxTicketsPerMonth: limits.maxTicketsPerMonth,
+      overageTickets: org.overageTickets,
+      overageAmountCents: org.overageAmountCents,
+      currentPeriodStart: org.currentPeriodStart,
+      currentPeriodEnd: org.currentPeriodEnd,
+      memberCount,
+      maxStaffUsers: limits.maxStaffUsers,
+      venueCount,
+      maxVenues: limits.maxVenues,
+      activeCampaignCount,
+      maxActiveCampaigns: limits.maxActiveCampaigns,
+      features: {
+        cardDesigner: limits.cardDesigner,
+        whiteLabelBranding: limits.whiteLabelBranding,
+        customDomain: limits.customDomain,
+        apiAccess: limits.apiAccess,
+        webhooks: limits.webhooks,
+        advancedAnalytics: limits.advancedAnalytics,
+      },
+    });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[org] usage error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /save-card-design — Save card design for org ──
+
+orgRouter.post('/save-card-design', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId, campaignId, name, design } = req.body;
+    const validOrgId = validateOrgId(orgId ?? user.orgId);
+
+    // Verify membership
+    const member = await prisma.orgMember.findUnique({
+      where: { orgId_userId: { orgId: validOrgId, userId: user.id } },
+    });
+    if (!member && user.role !== 'super_admin') {
+      throw new HttpError(403, 'Not a member of this organization.');
+    }
+    if (member && !['owner', 'admin'].includes(member.role)) {
+      throw new HttpError(403, 'Only admins can save card designs.');
+    }
+
+    // Check tier allows card designer
+    const org = await prisma.organization.findUnique({ where: { id: validOrgId } });
+    if (!org) throw new HttpError(404, 'Organization not found.');
+
+    const tier = org.subscriptionTier as SubscriptionTier;
+    const limits = TIER_LIMITS[tier];
+    if (!limits.cardDesigner) {
+      throw new HttpError(403, 'Card designer is not available on your plan. Upgrade to Growth or above.');
+    }
+
+    if (!name || typeof name !== 'string') {
+      throw new HttpError(400, 'Card design name is required.');
+    }
+    if (!design || typeof design !== 'object') {
+      throw new HttpError(400, 'Card design data is required.');
+    }
+
+    const cardDesign = await prisma.cardDesign.upsert({
+      where: {
+        orgId_campaignId: {
+          orgId: validOrgId,
+          campaignId: campaignId ?? null,
+        },
+      },
+      update: {
+        name: name.trim(),
+        design,
+      },
+      create: {
+        orgId: validOrgId,
+        campaignId: campaignId ?? null,
+        name: name.trim(),
+        design,
+      },
+    });
+
+    await writeAuditLog({
+      actorUserId: user.id,
+      actorRole: user.role,
+      actionType: 'card_design_saved',
+      targetType: 'card_design',
+      targetId: cardDesign.id,
+      details: { orgId: validOrgId, campaignId, name },
+    });
+
+    res.json({ cardDesign });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[org] save-card-design error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /complete-onboarding — Mark an onboarding step as complete ──
+
+orgRouter.post('/complete-onboarding', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId, step } = req.body;
+    const validOrgId = validateOrgId(orgId ?? user.orgId);
+
+    if (!step || typeof step !== 'string') {
+      throw new HttpError(400, 'Onboarding step name is required.');
+    }
+
+    const VALID_STEPS = [
+      'org_created',
+      'venue_added',
+      'campaign_created',
+      'odds_configured',
+      'first_ticket_issued',
+      'team_invited',
+      'branding_configured',
+      'completed',
+    ];
+
+    if (!VALID_STEPS.includes(step)) {
+      throw new HttpError(400, `Invalid onboarding step: ${step}`);
+    }
+
+    // Verify membership
+    const member = await prisma.orgMember.findUnique({
+      where: { orgId_userId: { orgId: validOrgId, userId: user.id } },
+    });
+    if (!member && user.role !== 'super_admin') {
+      throw new HttpError(403, 'Not a member of this organization.');
+    }
+
+    const onboarding = await prisma.onboarding.upsert({
+      where: { id: validOrgId },
+      update: {},
+      create: {
+        id: validOrgId,
+        completedSteps: [],
+        currentStep: 'org_created',
+      },
+    });
+
+    const completedSteps = onboarding.completedSteps as string[];
+    if (completedSteps.includes(step)) {
+      res.json({ onboarding });
+      return;
+    }
+
+    const newSteps = [...completedSteps, step];
+    const isFullyComplete = step === 'completed' || newSteps.length >= VALID_STEPS.length - 1;
+
+    const updated = await prisma.onboarding.update({
+      where: { id: validOrgId },
+      data: {
+        completedSteps: newSteps,
+        currentStep: step,
+        completedAt: isFullyComplete ? new Date() : undefined,
+      },
+    });
+
+    res.json({ onboarding: updated });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    console.error('[org] complete-onboarding error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
