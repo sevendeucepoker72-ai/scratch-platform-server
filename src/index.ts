@@ -98,7 +98,8 @@ app.get('/api/me', async (req, res) => {
 
     const user = await prisma.appUser.findUnique({ where: { authId: session.user.id } });
     if (!user) { res.status(404).json({ error: 'Profile not found' }); return; }
-    res.json(parseJsonFields(user as unknown as Record<string, unknown>));
+    const parsed = parseJsonFields(user as unknown as Record<string, unknown>);
+    res.json({ ...parsed, uid: parsed.id });
   } catch {
     res.status(401).json({ error: 'Invalid session' });
   }
