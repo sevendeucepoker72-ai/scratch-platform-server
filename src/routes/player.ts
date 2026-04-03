@@ -249,21 +249,10 @@ playerRouter.post('/reveal', requireAuth, async (req, res) => {
     checkRateLimit(`reveal:${req.user!.id}`, 30);
 
     const revealedCardIds = await prisma.$transaction(async (tx) => {
-      // Lock the ticket row to prevent concurrent reveals
-      const rows = await tx.$queryRaw<Array<{
-        id: string;
-        playerId: string | null;
-        venueId: string;
-        status: string;
-        isFrozen: boolean;
-        deck: unknown;
-        revealedCardIds: unknown;
-        scratchLimit: number;
-        gameType: string | null;
-      }>>`SELECT "id", "playerId", "venueId", "status", "isFrozen", "deck", "revealedCardIds", "scratchLimit", "gameType" FROM tickets WHERE id = ${ticketId} FOR UPDATE`;
-
-      if (!rows.length) throw new HttpError(404, 'Ticket not found.');
-      const ticket = rows[0];
+      // SQLite serializes writes via file lock — no FOR UPDATE needed
+      const ticketRow = await tx.ticket.findUnique({ where: { id: ticketId } });
+      if (!ticketRow) throw new HttpError(404, 'Ticket not found.');
+      const ticket = ticketRow;
 
       if (ticket.playerId !== req.user!.id) {
         await writeFraudEvent({
@@ -499,20 +488,10 @@ playerRouter.post('/submit-claim', requireAuth, async (req, res) => {
     const claimId = ticketId;
 
     await prisma.$transaction(async (tx) => {
-      // Lock ticket row and fetch it
-      const tickets = await tx.$queryRaw<Array<{
-        id: string;
-        playerId: string | null;
-        venueId: string;
-        campaignId: string;
-        status: string;
-        isFrozen: boolean;
-        claimCodeHash: string;
-        prizeSnapshot: unknown;
-      }>>`SELECT "id", "playerId", "venueId", "campaignId", "status", "isFrozen", "claimCodeHash", "prizeSnapshot" FROM tickets WHERE id = ${ticketId} FOR UPDATE`;
-
-      if (!tickets.length) throw new HttpError(404, 'Ticket not found.');
-      const ticket = tickets[0];
+      // SQLite serializes writes — no FOR UPDATE needed
+      const ticketRow = await tx.ticket.findUnique({ where: { id: ticketId } });
+      if (!ticketRow) throw new HttpError(404, 'Ticket not found.');
+      const ticket = ticketRow;
 
       if (ticket.playerId !== req.user!.id) {
         await writeFraudEvent({

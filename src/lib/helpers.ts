@@ -245,14 +245,9 @@ export const OVERAGE_RATE_CENTS: Record<SubscriptionTier, number> = {
 
 export async function checkTicketQuota(orgId: string): Promise<void> {
   await prisma.$transaction(async (tx) => {
-    // Use raw query for SELECT ... FOR UPDATE to prevent race conditions
-    const orgs = await tx.$queryRaw<Array<{
-      subscriptionTier: string;
-      ticketsIssuedThisMonth: number;
-    }>>`SELECT "subscriptionTier", "ticketsIssuedThisMonth" FROM organizations WHERE id = ${orgId} FOR UPDATE`;
-
-    if (!orgs.length) throw new HttpError(404, 'Organization not found.');
-    const org = orgs[0];
+    const orgRecord = await tx.organization.findUnique({ where: { id: orgId } });
+    if (!orgRecord) throw new HttpError(404, 'Organization not found.');
+    const org = orgRecord;
 
     const limits = TIER_LIMITS[org.subscriptionTier as SubscriptionTier];
     const monthlyLimit = limits?.maxTicketsPerMonth ?? 100;
