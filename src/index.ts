@@ -115,6 +115,17 @@ app.post('/api/seed-admin', async (req, res) => {
   res.json({ success: true, role: 'super_admin' });
 });
 
+// Fix existing distribution tickets to allow anonymous claims
+app.post('/api/fix-distribution-tickets', async (req, res) => {
+  const { secret } = req.body as { secret: string };
+  if (secret !== process.env.CLAIM_CODE_SECRET) { res.status(403).json({ error: 'Invalid secret' }); return; }
+  const result = await prisma.ticket.updateMany({
+    where: { distributionBatch: true, allowAnonymous: false },
+    data: { allowAnonymous: true },
+  });
+  res.json({ updated: result.count });
+});
+
 // Global error handler
 app.use((err: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const status = err.status ?? 500;

@@ -88,7 +88,7 @@ distributionRouter.post(
             gameType,
             status: 'issued',
             claimCodeHash,
-            allowAnonymous: campaign.allowAnonymous,
+            allowAnonymous: true, // distribution tickets always allow anonymous claims
             distributionBatch: true,
             issuedBy: user.id,
           },
