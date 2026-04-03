@@ -81,8 +81,8 @@ distributionRouter.post(
             venueId: campaign.venueId,
             campaignId: campaign.id,
             orgId: orgId ?? null,
-            deck: deck,
-            revealedCardIds: [],
+            deck: JSON.stringify(deck),
+            revealedCardIds: '[]',
             scratchLimit,
             gameType,
             status: 'issued',
@@ -145,7 +145,7 @@ distributionRouter.post('/public-ticket', async (req: Request, res: Response) =>
     if (!ticket) throw new HttpError(404, 'Ticket not found.');
     if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
 
-    const revealedCardIds = (ticket.revealedCardIds as string[]) ?? [];
+    const revealedCardIds = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
 
     res.json({
       ticketId: ticket.id,
@@ -156,7 +156,7 @@ distributionRouter.post('/public-ticket', async (req: Request, res: Response) =>
       isFrozen: ticket.isFrozen,
       freezeReason: ticket.freezeReason,
       allowAnonymous: ticket.allowAnonymous,
-      prizeSnapshot: ticket.prizeSnapshot,
+      prizeSnapshot: typeof ticket.prizeSnapshot === 'string' ? JSON.parse(ticket.prizeSnapshot) : ticket.prizeSnapshot,
       bestHandAtScratch: ticket.bestHandAtScratch,
       campaign: {
         id: ticket.campaign.id,
@@ -171,7 +171,7 @@ distributionRouter.post('/public-ticket', async (req: Request, res: Response) =>
         name: ticket.venue.name,
       },
       oddsProfile: {
-        prizes: ticket.campaign.oddsProfile.prizes,
+        prizes: typeof ticket.campaign.oddsProfile.prizes === 'string' ? JSON.parse(ticket.campaign.oddsProfile.prizes) : ticket.campaign.oddsProfile.prizes,
         scratchLimit: ticket.campaign.oddsProfile.scratchLimit,
       },
     });
@@ -220,7 +220,7 @@ distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) 
     const existingClaim = await prisma.claim.findUnique({ where: { ticketId: validId } });
     if (existingClaim) throw new HttpError(409, 'A claim has already been submitted for this ticket.');
 
-    const prizeSnapshot = ticket.prizeSnapshot as any;
+    const prizeSnapshot = typeof ticket.prizeSnapshot === 'string' ? JSON.parse(ticket.prizeSnapshot) : ticket.prizeSnapshot;
     if (!prizeSnapshot || prizeSnapshot.prizeAmount <= 0) {
       throw new HttpError(400, 'This ticket has no prize to claim.');
     }
@@ -233,7 +233,7 @@ distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) 
         venueId: ticket.venueId,
         campaignId: ticket.campaignId,
         orgId: ticket.orgId,
-        prizeSnapshot,
+        prizeSnapshot: JSON.stringify(prizeSnapshot),
         status: 'pending_staff_approval',
         isAnonymous: true,
         playerEmail: playerEmail ?? null,
@@ -247,11 +247,11 @@ distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) 
       data: {
         status: 'claimed',
         claimSubmittedAt: new Date(),
-        anonymousPlayer: {
+        anonymousPlayer: JSON.stringify({
           email: playerEmail ?? null,
           name: playerName ?? null,
           phone: playerPhone ?? null,
-        },
+        }),
       },
     });
 
@@ -292,8 +292,8 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
       throw new HttpError(400, `Ticket is already ${ticket.status}.`);
     }
 
-    const deck = ticket.deck as string[];
-    const revealedCardIds = (ticket.revealedCardIds as string[]) ?? [];
+    const deck = (typeof ticket.deck === 'string' ? JSON.parse(ticket.deck) : ticket.deck) as string[];
+    const revealedCardIds = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
 
     if (revealedCardIds.length >= ticket.scratchLimit) {
       throw new HttpError(400, 'All cards have been revealed.');
@@ -308,7 +308,7 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
 
     // Update ticket with new reveal
     const updateData: any = {
-      revealedCardIds: newRevealed,
+      revealedCardIds: JSON.stringify(newRevealed),
       status: ticket.status === 'issued' ? 'in_progress' : ticket.status,
     };
 
@@ -391,13 +391,17 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
       throw new HttpError(400, `Ticket is already ${ticket.status}.`);
     }
 
-    const revealedCardIds = (ticket.revealedCardIds as string[]) ?? [];
+    const revealedCardIds = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
     if (revealedCardIds.length < ticket.scratchLimit) {
       throw new HttpError(400, `Must reveal all ${ticket.scratchLimit} cards before finalizing.`);
     }
 
     const gameType = (ticket.gameType ?? 'poker') as GameType;
-    const oddsProfile = ticket.campaign.oddsProfile;
+    const rawOddsProfile = ticket.campaign.oddsProfile;
+    const oddsProfile = {
+      ...rawOddsProfile,
+      prizes: typeof rawOddsProfile.prizes === 'string' ? JSON.parse(rawOddsProfile.prizes) : rawOddsProfile.prizes,
+    };
     let prizeSnapshot: any;
 
     if (gameType === 'poker') {
@@ -414,7 +418,7 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
       where: { id: validId },
       data: {
         status: 'finalized',
-        prizeSnapshot,
+        prizeSnapshot: JSON.stringify(prizeSnapshot),
         finalizedAt: new Date(),
       },
     });

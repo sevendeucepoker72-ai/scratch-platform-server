@@ -110,7 +110,7 @@ apiKeyRouter.post('/create', requireAuth, async (req: Request, res: Response) =>
         name: name.trim(),
         keyPrefix,
         keyHash,
-        scopes,
+        scopes: JSON.stringify(scopes),
         isActive: true,
         createdBy: user.id,
         expiresAt,
@@ -132,7 +132,7 @@ apiKeyRouter.post('/create', requireAuth, async (req: Request, res: Response) =>
         id: apiKey.id,
         name: apiKey.name,
         keyPrefix: apiKey.keyPrefix,
-        scopes: apiKey.scopes,
+        scopes: typeof apiKey.scopes === 'string' ? JSON.parse(apiKey.scopes) : apiKey.scopes,
         isActive: apiKey.isActive,
         createdAt: apiKey.createdAt,
         expiresAt: apiKey.expiresAt,
@@ -240,7 +240,10 @@ apiKeyRouter.post('/list', requireAuth, async (req: Request, res: Response) => {
       orderBy: { createdAt: 'desc' },
     });
 
-    res.json({ apiKeys });
+    res.json({ apiKeys: apiKeys.map(k => ({
+      ...k,
+      scopes: typeof k.scopes === 'string' ? JSON.parse(k.scopes) : k.scopes,
+    })) });
   } catch (err) {
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.message });

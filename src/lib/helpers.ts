@@ -102,7 +102,7 @@ export async function writeAuditLog(params: {
       targetType: params.targetType,
       targetId: params.targetId,
       venueId: params.venueId ?? null,
-      details: sanitizeDetails(params.details ?? {}),
+      details: JSON.stringify(sanitizeDetails(params.details ?? {})),
     },
   });
 }
@@ -123,7 +123,7 @@ export async function writeFraudEvent(params: {
         playerId: params.playerId,
         venueId: params.venueId ?? null,
         signal: params.signal,
-        details: params.details ?? {},
+        details: JSON.stringify(params.details ?? {}),
       },
     });
 

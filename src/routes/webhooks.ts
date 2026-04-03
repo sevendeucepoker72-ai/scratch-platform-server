@@ -154,7 +154,7 @@ webhookRouter.post('/register', requireAuth, async (req: Request, res: Response)
         orgId: validOrgId,
         url,
         description: description ?? null,
-        events,
+        events: JSON.stringify(events),
         secret: encryptedSecret,
         isActive: true,
       },
@@ -173,7 +173,7 @@ webhookRouter.post('/register', requireAuth, async (req: Request, res: Response)
       endpoint: {
         id: endpoint.id,
         url: endpoint.url,
-        events: endpoint.events,
+        events: typeof endpoint.events === 'string' ? JSON.parse(endpoint.events) : endpoint.events,
         description: endpoint.description,
         isActive: endpoint.isActive,
         createdAt: endpoint.createdAt,
@@ -277,7 +277,10 @@ webhookRouter.post('/list', requireAuth, async (req: Request, res: Response) => 
       orderBy: { createdAt: 'desc' },
     });
 
-    res.json({ endpoints });
+    res.json({ endpoints: endpoints.map(e => ({
+      ...e,
+      events: typeof e.events === 'string' ? JSON.parse(e.events) : e.events,
+    })) });
   } catch (err) {
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.message });

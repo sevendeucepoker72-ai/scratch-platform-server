@@ -55,7 +55,7 @@ playerRouter.post('/issue-ticket', async (req, res) => {
         throw new HttpError(401, 'Invalid or expired API key.');
       }
 
-      const scopes = (apiKey.scopes as string[]) ?? [];
+      const scopes = (typeof apiKey.scopes === 'string' ? JSON.parse(apiKey.scopes) : apiKey.scopes) as string[];
       if (!scopes.includes('tickets:issue')) {
         throw new HttpError(403, 'API key does not have tickets:issue scope.');
       }
@@ -91,7 +91,7 @@ playerRouter.post('/issue-ticket', async (req, res) => {
         email: appUser.email,
         displayName: appUser.displayName,
         role: appUser.role as any,
-        venueIds: appUser.venueIds,
+        venueIds: typeof appUser.venueIds === 'string' ? JSON.parse(appUser.venueIds) : appUser.venueIds,
         isActive: appUser.isActive,
         orgId: appUser.orgId ?? undefined,
       };
@@ -156,8 +156,8 @@ playerRouter.post('/issue-ticket', async (req, res) => {
         venueId,
         campaignId,
         orgId: orgId ?? null,
-        deck: deck as any,
-        revealedCardIds: [] as any,
+        deck: JSON.stringify(deck),
+        revealedCardIds: '[]',
         scratchLimit: scratchLimitOverride,
         gameType,
         status: 'issued',
@@ -281,8 +281,8 @@ playerRouter.post('/reveal', requireAuth, async (req, res) => {
         throw new HttpError(409, `Ticket status: '${ticket.status}'.`);
       }
 
-      const deck = ticket.deck as string[];
-      const revealed = ticket.revealedCardIds as string[];
+      const deck = (typeof ticket.deck === 'string' ? JSON.parse(ticket.deck) : ticket.deck) as string[];
+      const revealed = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
 
       // Deck-order enforcement: the revealed item is always deck[revealedCount].
       const nextDeckItem = deck[revealed.length];
@@ -335,7 +335,7 @@ playerRouter.post('/reveal', requireAuth, async (req, res) => {
       await tx.ticket.update({
         where: { id: ticketId },
         data: {
-          revealedCardIds: newRevealed as any,
+          revealedCardIds: JSON.stringify(newRevealed),
           status: 'in_progress',
         },
       });
@@ -388,7 +388,7 @@ playerRouter.post('/finalize', requireAuth, async (req, res) => {
 
     if (ticket.isFrozen) throw new HttpError(409, 'Ticket is frozen.');
 
-    const revealedCardIds = ticket.revealedCardIds as string[];
+    const revealedCardIds = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
     if (revealedCardIds.length < ticket.scratchLimit) {
       await writeFraudEvent({
         ticketId,
@@ -416,7 +416,7 @@ playerRouter.post('/finalize', requireAuth, async (req, res) => {
     if (ticketGameType !== 'poker' && GAME_ENGINES[ticketGameType]) {
       const gameResult = GAME_ENGINES[ticketGameType].evaluate(revealedCardIds);
       // Cast odds.prizes to generic shape (tierName = handRank for non-poker)
-      const prizesRaw = (odds as any).prizes ?? [];
+      const prizesRaw = typeof (odds as any).prizes === 'string' ? JSON.parse((odds as any).prizes) : ((odds as any).prizes ?? []);
       const genericOdds = {
         prizes: (prizesRaw as Array<Record<string, unknown>>).map((p) => ({
           tierName: (p.tierName ?? p.handRank) as string,
@@ -429,7 +429,7 @@ playerRouter.post('/finalize', requireAuth, async (req, res) => {
     } else {
       const handResult = evaluateBestHand(revealedCardIds);
       const oddsData = {
-        prizes: ((odds as any).prizes ?? []) as Array<{
+        prizes: (typeof (odds as any).prizes === 'string' ? JSON.parse((odds as any).prizes) : ((odds as any).prizes ?? [])) as Array<{
           handRank: string;
           prizeLabel: string;
           prizeAmount: number;
@@ -445,8 +445,8 @@ playerRouter.post('/finalize', requireAuth, async (req, res) => {
         where: { id: ticketId },
         data: {
           status: 'finalized',
-          bestHandAtScratch: prizeSnapshot as any,
-          prizeSnapshot: prizeSnapshot as any,
+          bestHandAtScratch: prizeSnapshot,
+          prizeSnapshot: JSON.stringify(prizeSnapshot),
           finalizedAt: new Date(),
         },
       });
@@ -459,10 +459,10 @@ playerRouter.post('/finalize', requireAuth, async (req, res) => {
           targetType: 'scratchTicket',
           targetId: ticketId,
           venueId: ticket.venueId,
-          details: {
+          details: JSON.stringify({
             handRank: prizeSnapshot.handRank,
             prizeAmount: prizeSnapshot.prizeAmount,
-          },
+          }),
         },
       });
 
@@ -568,7 +568,7 @@ playerRouter.post('/submit-claim', requireAuth, async (req, res) => {
           playerId: req.user!.id,
           venueId: ticket.venueId,
           campaignId: ticket.campaignId,
-          prizeSnapshot: ticket.prizeSnapshot as any,
+          prizeSnapshot: typeof ticket.prizeSnapshot === 'string' ? ticket.prizeSnapshot : JSON.stringify(ticket.prizeSnapshot),
           status: 'pending_staff_approval',
           submittedAt: new Date(),
         },
@@ -591,7 +591,7 @@ playerRouter.post('/submit-claim', requireAuth, async (req, res) => {
           actionType: 'claim_submitted',
           targetType: 'scratchClaim',
           targetId: claimId,
-          details: { ticketId },
+          details: JSON.stringify({ ticketId }),
         },
       });
     });

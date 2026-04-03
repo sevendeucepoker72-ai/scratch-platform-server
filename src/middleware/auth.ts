@@ -53,7 +53,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       email: appUser.email,
       displayName: appUser.displayName,
       role: appUser.role as UserRole,
-      venueIds: appUser.venueIds,
+      venueIds: typeof appUser.venueIds === 'string' ? JSON.parse(appUser.venueIds) : appUser.venueIds,
       isActive: appUser.isActive,
       orgId: appUser.orgId ?? undefined,
     };

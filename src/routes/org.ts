@@ -67,7 +67,7 @@ orgRouter.post('/create', requireAuth, async (req: Request, res: Response) => {
       });
 
       // Update user with orgId and orgRole
-      await tx.user.update({
+      await tx.appUser.update({
         where: { id: user.id },
         data: {
           orgId: newOrg.id,
@@ -80,7 +80,7 @@ orgRouter.post('/create', requireAuth, async (req: Request, res: Response) => {
       await tx.onboarding.create({
         data: {
           id: newOrg.id,
-          completedSteps: ['org_created'],
+          completedSteps: JSON.stringify(['org_created']),
           currentStep: 'org_created',
         },
       });
@@ -278,13 +278,13 @@ orgRouter.post('/save-card-design', requireAuth, async (req: Request, res: Respo
       },
       update: {
         name: name.trim(),
-        design,
+        design: JSON.stringify(design),
       },
       create: {
         orgId: validOrgId,
         campaignId: campaignId ?? null,
         name: name.trim(),
-        design,
+        design: JSON.stringify(design),
       },
     });
 
@@ -297,7 +297,7 @@ orgRouter.post('/save-card-design', requireAuth, async (req: Request, res: Respo
       details: { orgId: validOrgId, campaignId, name },
     });
 
-    res.json({ cardDesign });
+    res.json({ cardDesign: { ...cardDesign, design: typeof cardDesign.design === 'string' ? JSON.parse(cardDesign.design) : cardDesign.design } });
   } catch (err) {
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.message });
@@ -348,14 +348,14 @@ orgRouter.post('/complete-onboarding', requireAuth, async (req: Request, res: Re
       update: {},
       create: {
         id: validOrgId,
-        completedSteps: [],
+        completedSteps: '[]',
         currentStep: 'org_created',
       },
     });
 
-    const completedSteps = onboarding.completedSteps as string[];
+    const completedSteps = JSON.parse(onboarding.completedSteps as string) as string[];
     if (completedSteps.includes(step)) {
-      res.json({ onboarding });
+      res.json({ onboarding: { ...onboarding, completedSteps } });
       return;
     }
 
@@ -365,13 +365,13 @@ orgRouter.post('/complete-onboarding', requireAuth, async (req: Request, res: Re
     const updated = await prisma.onboarding.update({
       where: { id: validOrgId },
       data: {
-        completedSteps: newSteps,
+        completedSteps: JSON.stringify(newSteps),
         currentStep: step,
         completedAt: isFullyComplete ? new Date() : undefined,
       },
     });
 
-    res.json({ onboarding: updated });
+    res.json({ onboarding: { ...updated, completedSteps: newSteps } });
   } catch (err) {
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.message });

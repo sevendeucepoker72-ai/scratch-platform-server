@@ -46,7 +46,7 @@ router.post(
           throw new HttpError(409, 'Ticket is frozen and cannot be approved.');
         }
 
-        const prizeSnapshot = claim.prizeSnapshot as { prizeAmount?: number } | null;
+        const prizeSnapshot = (typeof claim.prizeSnapshot === 'string' ? JSON.parse(claim.prizeSnapshot) : claim.prizeSnapshot) as { prizeAmount?: number } | null;
         const prizeAmount = ticket.payoutOverride ?? prizeSnapshot?.prizeAmount ?? 0;
         const now = new Date();
 
@@ -92,11 +92,11 @@ router.post(
             targetType: 'claim',
             targetId: claimId,
             venueId: venueId,
-            details: sanitizeDetails({
+            details: JSON.stringify(sanitizeDetails({
               ticketId: claim.ticketId,
               prizeAmount,
               approvalNote: approvalNote ?? null,
-            }),
+            })),
           },
         });
 
@@ -189,10 +189,10 @@ router.post(
             targetType: 'claim',
             targetId: claimId,
             venueId: venueId,
-            details: sanitizeDetails({
+            details: JSON.stringify(sanitizeDetails({
               ticketId: claim.ticketId,
               denialReason: denialReason.trim(),
-            }),
+            })),
           },
         });
 
@@ -261,7 +261,7 @@ router.post(
           throw new HttpError(409, 'Ticket is frozen and cannot be redeemed.');
         }
 
-        const prizeSnapshot = claim.prizeSnapshot as { prizeAmount?: number } | null;
+        const prizeSnapshot = (typeof claim.prizeSnapshot === 'string' ? JSON.parse(claim.prizeSnapshot) : claim.prizeSnapshot) as { prizeAmount?: number } | null;
         const prizeAmount = ticket.payoutOverride ?? prizeSnapshot?.prizeAmount ?? 0;
         const now = new Date();
 
@@ -307,12 +307,12 @@ router.post(
             targetType: 'ticket',
             targetId: claim.ticketId,
             venueId: venueId,
-            details: sanitizeDetails({
+            details: JSON.stringify(sanitizeDetails({
               claimId,
               redemptionId: redemption.id,
               prizeAmount,
               notes: notes ?? null,
-            }),
+            })),
           },
         });
 
@@ -396,9 +396,9 @@ router.post(
             targetType: 'ticket',
             targetId: ticketId,
             venueId: venueId,
-            details: sanitizeDetails({
+            details: JSON.stringify(sanitizeDetails({
               freezeReason: freezeReason.trim(),
-            }),
+            })),
           },
         });
 
@@ -471,10 +471,10 @@ router.post(
             targetType: 'ticket',
             targetId: ticketId,
             venueId: venueId,
-            details: sanitizeDetails({
+            details: JSON.stringify(sanitizeDetails({
               previousFreezeReason: ticket.freezeReason ?? 'none',
               unfreezeReason: unfreezeReason ?? null,
-            }),
+            })),
           },
         });
 
@@ -565,11 +565,11 @@ router.post(
             targetType: 'ticket',
             targetId: ticketId,
             venueId: venueId,
-            details: sanitizeDetails({
+            details: JSON.stringify(sanitizeDetails({
               previousPayout: previousPayout ?? 'none',
               newPayoutAmount,
               note: note ?? null,
-            }),
+            })),
           },
         });
 
@@ -688,12 +688,12 @@ router.post(
             targetType: 'risk_score',
             targetId: ticketId,
             venueId: venueId,
-            details: sanitizeDetails({
+            details: JSON.stringify(sanitizeDetails({
               resolutionCode,
               resolutionNote: resolutionNote ?? null,
               previousScore: riskScore.score,
               previousSeverity: riskScore.severity,
-            }),
+            })),
           },
         });
 

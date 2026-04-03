@@ -214,7 +214,7 @@ inviteRouter.post('/accept', requireAuth, async (req: Request, res: Response) =>
       });
 
       // Update user record
-      await tx.user.update({
+      await tx.appUser.update({
         where: { id: user.id },
         data: {
           orgId: invite.orgId,
@@ -298,7 +298,7 @@ inviteRouter.post('/remove', requireAuth, async (req: Request, res: Response) =>
         where: { orgId_userId: { orgId: validOrgId, userId: targetUserId } },
       });
 
-      await tx.user.update({
+      await tx.appUser.update({
         where: { id: targetUserId },
         data: {
           orgId: null,

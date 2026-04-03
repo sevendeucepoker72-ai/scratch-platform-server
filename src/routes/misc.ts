@@ -56,7 +56,7 @@ miscRouter.post('/resend-claim-code', requireAuth, async (req: Request, res: Res
     // Determine recipient email
     const recipientEmail = ticket.playerId
       ? (await prisma.appUser.findUnique({ where: { id: ticket.playerId } }))?.email
-      : (ticket.anonymousPlayer as any)?.email;
+      : (typeof ticket.anonymousPlayer === 'string' ? JSON.parse(ticket.anonymousPlayer) : ticket.anonymousPlayer)?.email;
 
     if (!recipientEmail) {
       throw new HttpError(400, 'No email address associated with this ticket.');
