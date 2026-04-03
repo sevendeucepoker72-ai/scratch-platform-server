@@ -218,12 +218,14 @@ distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) 
     if (ticket.isFrozen) throw new HttpError(403, 'Ticket is frozen.');
     if (ticket.status !== 'finalized') throw new HttpError(400, 'Ticket must be finalized before claiming.');
 
-    // Verify claim code
-    const expectedHash = ticket.claimCodeHash;
-    const providedHash = hashClaimCode(claimCode.trim().toUpperCase());
-    if (providedHash !== expectedHash) {
-      throw new HttpError(403, 'Invalid claim code.');
+    // IP lock check: only the original player can claim
+    const clientIp = getClientIp(req);
+    if (ticket.lockedIp && ticket.lockedIp !== clientIp) {
+      throw new HttpError(403, 'This ticket is locked to another player.');
     }
+
+    // Skip claim code verification for distribution tickets — IP lock is sufficient
+    // The player already proved ownership by scratching from the same IP
 
     // Check if claim already exists
     const existingClaim = await prisma.claim.findUnique({ where: { ticketId: validId } });
