@@ -4,7 +4,7 @@
 import * as crypto from 'crypto';
 
 export type GameType =
-  | 'poker' | 'match3' | 'lucky7' | 'treasure' | 'color_match'
+  | 'poker' | 'poker_pick' | 'match3' | 'lucky7' | 'treasure' | 'color_match'
   | 'dice_duel' | 'fruit_slots' | 'number_pick' | 'emoji_trio'
   | 'multiplier' | 'word_builder';
 
@@ -245,6 +245,7 @@ export interface GameEngine {
 
 export const GAME_ENGINES: Record<GameType, GameEngine> = {
   poker:        { buildDeck: () => { throw new Error('poker uses buildShuffledDeck'); }, evaluate: () => { throw new Error('use evaluateBestHand'); }, scratchLimit: 7, displayName: 'Poker Hands', description: 'Reveal 7 cards, best 5-card poker hand wins', icon: '🃏' },
+  poker_pick:   { buildDeck: () => { throw new Error('poker_pick uses buildShuffledDeck'); }, evaluate: () => { throw new Error('use evaluateBestHand'); }, scratchLimit: 7, displayName: 'Pick Your Hand', description: 'Pick 7 from 52 face-down cards, best 5-card hand wins', icon: '🎴' },
   match3:       { buildDeck: buildMatch3Deck, evaluate: evaluateMatch3, scratchLimit: 6, displayName: 'Match 3', description: 'Reveal 6 symbols, match 3 to win', icon: '🍒' },
   lucky7:       { buildDeck: buildLucky7Deck, evaluate: evaluateLucky7, scratchLimit: 3, displayName: 'Lucky 7', description: 'Reveal 3 numbers, sum to 7 wins big', icon: '7️⃣' },
   treasure:     { buildDeck: buildTreasureDeck, evaluate: evaluateTreasure, scratchLimit: 9, displayName: 'Treasure Hunt', description: 'Uncover all 9 cells to find the chest', icon: '🏴‍☠️' },

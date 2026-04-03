@@ -69,7 +69,7 @@ distributionRouter.post(
         const claimCodeHash = hashClaimCode(claimCode);
 
         let deck: string[];
-        if (gameType === 'poker') {
+        if (gameType === 'poker' || gameType === 'poker_pick') {
           deck = buildShuffledDeck();
         } else {
           const engine = GAME_ENGINES[gameType];
@@ -148,11 +148,14 @@ distributionRouter.post('/public-ticket', async (req: Request, res: Response) =>
 
     const revealedCardIds = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
 
+    const deck = (typeof ticket.deck === 'string' ? JSON.parse(ticket.deck) : ticket.deck) as string[];
+
     res.json({
       ticketId: ticket.id,
       status: ticket.status,
       gameType: ticket.gameType,
       scratchLimit: ticket.scratchLimit,
+      deckSize: deck.length,
       revealedCardIds,
       isFrozen: ticket.isFrozen,
       freezeReason: ticket.freezeReason,
@@ -300,8 +303,23 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
       throw new HttpError(400, 'All cards have been revealed.');
     }
 
-    // Deck-order enforced: next card is deck[revealedCardIds.length]
-    const nextCard = deck[revealedCardIds.length];
+    // For poker_pick: player chooses a card index from the full deck
+    // For all other types: sequential deck order
+    const gameType = (ticket.gameType ?? 'poker') as GameType;
+    const { cardIndex } = req.body as { cardIndex?: number };
+    let nextCard: string;
+
+    if (gameType === 'poker_pick' && cardIndex !== undefined) {
+      if (typeof cardIndex !== 'number' || cardIndex < 0 || cardIndex >= deck.length) {
+        throw new HttpError(400, 'Invalid card index.');
+      }
+      nextCard = deck[cardIndex];
+      if (revealedCardIds.includes(nextCard)) {
+        throw new HttpError(400, 'Card already revealed.');
+      }
+    } else {
+      nextCard = deck[revealedCardIds.length];
+    }
     if (!nextCard) throw new HttpError(400, 'No more cards to reveal.');
 
     const newRevealed = [...revealedCardIds, nextCard];
@@ -318,7 +336,7 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
       const gameType = (ticket.gameType ?? 'poker') as GameType;
       let bestHandAtScratch: any;
 
-      if (gameType === 'poker') {
+      if (gameType === 'poker' || gameType === 'poker_pick') {
         const handResult = evaluateBestHand(newRevealed);
         bestHandAtScratch = {
           handRank: handResult.handRank,
