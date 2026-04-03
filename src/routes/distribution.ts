@@ -38,7 +38,7 @@ distributionRouter.post(
   requireRole('staff', 'admin', 'super_admin'),
   async (req: Request, res: Response) => {
     try {
-      const { campaignId, quantity, count, venueId, orgId } = req.body;
+      const { campaignId, quantity, count, venueId, orgId, onePerIp } = req.body;
       const user = req.user!;
       const qty = quantity ?? count;
 
@@ -93,6 +93,7 @@ distributionRouter.post(
             status: 'issued',
             claimCodeHash,
             allowAnonymous: true, // distribution tickets always allow anonymous claims
+            onePerIp: onePerIp === true,
             distributionBatch: true,
             issuedBy: user.id,
           },
@@ -306,6 +307,19 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
       throw new HttpError(403, 'This ticket is already in use by another player.');
     }
     if (!ticket.lockedIp) {
+      // One-per-IP check: if enabled, reject if this IP already used another ticket in the same campaign
+      if (ticket.onePerIp) {
+        const existing = await prisma.ticket.findFirst({
+          where: {
+            campaignId: ticket.campaignId,
+            lockedIp: clientIp,
+            id: { not: validId },
+          },
+        });
+        if (existing) {
+          throw new HttpError(403, 'You have already used a ticket for this campaign. One per person.');
+        }
+      }
       await prisma.ticket.update({ where: { id: validId }, data: { lockedIp: clientIp } });
     }
 

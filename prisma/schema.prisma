@@ -242,6 +242,7 @@ model Ticket {
   allowAnonymous  Boolean  @default(false)
   distributionBatch Boolean @default(false)
   lockedIp        String?  // first visitor's IP, locks ticket to them
+  onePerIp        Boolean  @default(false) // if true, IP can only use 1 ticket per campaign
   issuedBy        String?
   anonymousPlayer String?  // { email, name, phone } (JSON string)
 
