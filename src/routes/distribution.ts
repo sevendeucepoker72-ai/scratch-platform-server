@@ -49,12 +49,12 @@ distributionRouter.post(
       if (!campaign) throw new HttpError(404, 'Campaign not found.');
       if (!campaign.isActive) throw new HttpError(400, 'Campaign is not active.');
 
-      const orgId = campaign.orgId ?? undefined;
+      const effectiveOrgId = orgId ?? campaign.orgId ?? undefined;
 
       // Check quota for each ticket
-      if (orgId) {
+      if (effectiveOrgId) {
         for (let i = 0; i < qty; i++) {
-          await checkTicketQuota(orgId);
+          await checkTicketQuota(effectiveOrgId);
         }
       }
 
@@ -81,7 +81,7 @@ distributionRouter.post(
           data: {
             venueId: campaign.venueId,
             campaignId: campaign.id,
-            orgId: orgId ?? null,
+            orgId: effectiveOrgId ?? null,
             deck: JSON.stringify(deck),
             revealedCardIds: '[]',
             scratchLimit,
