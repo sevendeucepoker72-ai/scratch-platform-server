@@ -12,6 +12,155 @@ import {
 
 export const orgRouter = Router();
 
+// ── Venue CRUD ──
+
+orgRouter.post('/venues/create', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId, name, address } = req.body;
+    if (!name || typeof name !== 'string') throw new HttpError(400, 'Venue name required.');
+    const venue = await prisma.venue.create({
+      data: { orgId: orgId ?? user.orgId ?? null, name: name.trim(), address: address ?? '' },
+    });
+    res.json({ venue, venueId: venue.id });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] venues/create error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+orgRouter.post('/venues/update', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { venueId, isActive, name, address } = req.body;
+    if (!venueId) throw new HttpError(400, 'venueId required.');
+    const data: Record<string, unknown> = {};
+    if (isActive !== undefined) data.isActive = isActive;
+    if (name !== undefined) data.name = name;
+    if (address !== undefined) data.address = address;
+    const venue = await prisma.venue.update({ where: { id: venueId }, data });
+    res.json({ venue });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] venues/update error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Campaign CRUD ──
+
+orgRouter.post('/campaigns/create', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId, venueId, name, description, gameType, isActive, ticketPrice, startDate, endDate,
+            guidelines, guidelinesRequired, allowAnonymous, totalTicketsLimit, prizes, scratchLimit, oddsProfileName } = req.body;
+    const validOrgId = orgId ?? user.orgId;
+
+    // Create odds profile first
+    const oddsProfile = await prisma.oddsProfile.create({
+      data: {
+        orgId: validOrgId,
+        name: oddsProfileName ?? `${name} Prizes`,
+        prizes: JSON.stringify(prizes ?? []),
+        scratchLimit: scratchLimit ?? 7,
+      },
+    });
+
+    const campaign = await prisma.campaign.create({
+      data: {
+        orgId: validOrgId, venueId, name: name.trim(), description: description ?? null,
+        oddsProfileId: oddsProfile.id, gameType: gameType ?? 'poker',
+        isActive: isActive ?? true, ticketPrice: ticketPrice ?? 0,
+        startDate: startDate ? new Date(startDate) : null,
+        endDate: endDate ? new Date(endDate) : null,
+        guidelines: guidelines ?? null, guidelinesRequired: guidelinesRequired ?? false,
+        allowAnonymous: allowAnonymous ?? false, totalTicketsLimit: totalTicketsLimit ?? null,
+        createdBy: user.id,
+      },
+    });
+    res.json({ campaign, campaignId: campaign.id, oddsProfileId: oddsProfile.id });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] campaigns/create error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+orgRouter.post('/campaigns/update', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { campaignId, ...updateFields } = req.body;
+    if (!campaignId) throw new HttpError(400, 'campaignId required.');
+    const data: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(updateFields)) {
+      if (['name', 'description', 'isActive', 'ticketPrice', 'guidelines', 'guidelinesRequired',
+           'allowAnonymous', 'totalTicketsLimit', 'gameType'].includes(k)) {
+        data[k] = v;
+      }
+      if (k === 'startDate' || k === 'endDate') data[k] = v ? new Date(v as string) : null;
+    }
+    const campaign = await prisma.campaign.update({ where: { id: campaignId }, data });
+    res.json({ campaign });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] campaigns/update error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+orgRouter.post('/odds-profiles/update', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { profileId, prizes, scratchLimit, name } = req.body;
+    if (!profileId) throw new HttpError(400, 'profileId required.');
+    const data: Record<string, unknown> = {};
+    if (prizes !== undefined) data.prizes = JSON.stringify(prizes);
+    if (scratchLimit !== undefined) data.scratchLimit = scratchLimit;
+    if (name !== undefined) data.name = name;
+    const profile = await prisma.oddsProfile.update({ where: { id: profileId }, data });
+    res.json({ profile });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] odds-profiles/update error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Onboarding shortcuts ──
+
+orgRouter.post('/create-venue', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { name, address } = req.body;
+    if (!name) throw new HttpError(400, 'Venue name required.');
+    const venue = await prisma.venue.create({
+      data: { orgId: user.orgId ?? null, name: name.trim(), address: address ?? '' },
+    });
+    res.json({ venueId: venue.id, venue });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] create-venue error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+orgRouter.post('/create-default-campaign', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { venueId, name, prizes, scratchLimit } = req.body;
+    if (!venueId || !name) throw new HttpError(400, 'venueId and name required.');
+    const oddsProfile = await prisma.oddsProfile.create({
+      data: { orgId: user.orgId, name: `${name} Prizes`, prizes: JSON.stringify(prizes ?? []), scratchLimit: scratchLimit ?? 7 },
+    });
+    const campaign = await prisma.campaign.create({
+      data: { orgId: user.orgId, venueId, name: name.trim(), oddsProfileId: oddsProfile.id, isActive: true, createdBy: user.id },
+    });
+    res.json({ campaignId: campaign.id, campaign });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[org] create-default-campaign error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── POST /create — Create a new organization ──
 
 orgRouter.post('/create', requireAuth, async (req: Request, res: Response) => {

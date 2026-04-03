@@ -684,3 +684,85 @@ miscRouter.post(
     }
   }
 );
+
+// ── Admin campaign routes ──
+
+miscRouter.post('/admin/campaigns', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { venueId, name, oddsProfileId, isActive, ticketPrice, orgId } = req.body;
+    if (!venueId || !name || !oddsProfileId) throw new HttpError(400, 'venueId, name, oddsProfileId required.');
+    const campaign = await prisma.campaign.create({
+      data: { orgId: orgId ?? null, venueId, name, oddsProfileId, isActive: isActive ?? true, ticketPrice: ticketPrice ?? 0, createdBy: req.user!.id },
+    });
+    res.json({ campaign });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[misc] admin/campaigns error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+miscRouter.post('/admin/campaigns/update', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { campaignId, isActive, name } = req.body;
+    if (!campaignId) throw new HttpError(400, 'campaignId required.');
+    const data: Record<string, unknown> = {};
+    if (isActive !== undefined) data.isActive = isActive;
+    if (name !== undefined) data.name = name;
+    const campaign = await prisma.campaign.update({ where: { id: campaignId }, data });
+    res.json({ campaign });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[misc] admin/campaigns/update error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Super admin routes ──
+
+miscRouter.post('/superadmin/users/update', requireAuth, requireRole('super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { userId, role, isActive, venueIds } = req.body;
+    if (!userId) throw new HttpError(400, 'userId required.');
+    const data: Record<string, unknown> = {};
+    if (role !== undefined) data.role = role;
+    if (isActive !== undefined) data.isActive = isActive;
+    if (venueIds !== undefined) data.venueIds = JSON.stringify(venueIds);
+    const user = await prisma.appUser.update({ where: { id: userId }, data });
+    res.json({ user });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[misc] superadmin/users/update error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+miscRouter.post('/superadmin/venues/create', requireAuth, requireRole('super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { name, address, orgId } = req.body;
+    if (!name) throw new HttpError(400, 'Venue name required.');
+    const venue = await prisma.venue.create({ data: { name: name.trim(), address: address ?? '', orgId: orgId ?? null } });
+    res.json({ venue, venueId: venue.id });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[misc] superadmin/venues/create error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+miscRouter.post('/superadmin/venues/update', requireAuth, requireRole('super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { venueId, isActive, name, address } = req.body;
+    if (!venueId) throw new HttpError(400, 'venueId required.');
+    const data: Record<string, unknown> = {};
+    if (isActive !== undefined) data.isActive = isActive;
+    if (name !== undefined) data.name = name;
+    if (address !== undefined) data.address = address;
+    const venue = await prisma.venue.update({ where: { id: venueId }, data });
+    res.json({ venue });
+  } catch (err) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[misc] superadmin/venues/update error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
