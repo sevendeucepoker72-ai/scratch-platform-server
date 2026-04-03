@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "prisma generate",
-    "start": "prisma db push --skip-generate && tsx src/index.ts",
+    "build": "npx prisma generate",
+    "start": "npx prisma db push --skip-generate && npx tsx src/index.ts",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
