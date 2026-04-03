@@ -93,6 +93,16 @@ app.get('/api/me', async (req, res) => {
   }
 });
 
+// One-time admin seed endpoint (remove after first use)
+app.post('/api/seed-admin', async (req, res) => {
+  const { email, secret } = req.body as { email: string; secret: string };
+  if (secret !== process.env.CLAIM_CODE_SECRET) { res.status(403).json({ error: 'Invalid secret' }); return; }
+  const user = await prisma.appUser.findUnique({ where: { email } });
+  if (!user) { res.status(404).json({ error: 'User not found' }); return; }
+  await prisma.appUser.update({ where: { id: user.id }, data: { role: 'super_admin' } });
+  res.json({ success: true, role: 'super_admin' });
+});
+
 // Global error handler
 app.use((err: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const status = err.status ?? 500;
