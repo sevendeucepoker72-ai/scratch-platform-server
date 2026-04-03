@@ -53,16 +53,22 @@ orgRouter.post('/campaigns/create', requireAuth, async (req: Request, res: Respo
   try {
     const user = req.user!;
     const { orgId, venueId, name, description, gameType, isActive, ticketPrice, startDate, endDate,
-            guidelines, guidelinesRequired, allowAnonymous, totalTicketsLimit, prizes, scratchLimit, oddsProfileName } = req.body;
+            guidelines, guidelinesRequired, allowAnonymous, totalTicketsLimit,
+            prizes, scratchLimit, oddsProfileName, oddsProfile: oddsProfileInput } = req.body;
     const validOrgId = orgId ?? user.orgId;
+
+    // Support both flat fields and nested oddsProfile object from frontend
+    const finalPrizes = prizes ?? oddsProfileInput?.prizes ?? [];
+    const finalScratchLimit = scratchLimit ?? oddsProfileInput?.scratchLimit ?? 7;
+    const finalOddsName = oddsProfileName ?? oddsProfileInput?.name ?? `${name} Prizes`;
 
     // Create odds profile first
     const oddsProfile = await prisma.oddsProfile.create({
       data: {
         orgId: validOrgId,
-        name: oddsProfileName ?? `${name} Prizes`,
-        prizes: JSON.stringify(prizes ?? []),
-        scratchLimit: scratchLimit ?? 7,
+        name: finalOddsName,
+        prizes: JSON.stringify(finalPrizes),
+        scratchLimit: finalScratchLimit,
       },
     });
 
