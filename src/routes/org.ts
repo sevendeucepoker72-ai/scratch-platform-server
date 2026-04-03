@@ -434,7 +434,7 @@ orgRouter.post('/save-card-design', requireAuth, async (req: Request, res: Respo
 
     const tier = org.subscriptionTier as SubscriptionTier;
     const limits = TIER_LIMITS[tier];
-    if (!limits.cardDesigner) {
+    if (!limits.cardDesigner && user.role !== 'super_admin') {
       throw new HttpError(403, 'Card designer is not available on your plan. Upgrade to Growth or above.');
     }
 

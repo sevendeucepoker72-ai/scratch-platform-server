@@ -44,7 +44,7 @@ inviteRouter.post('/invite', requireAuth, async (req: Request, res: Response) =>
     // Check staff user limit
     const tier = org.subscriptionTier as SubscriptionTier;
     const limits = TIER_LIMITS[tier];
-    if (limits.maxStaffUsers !== -1) {
+    if (limits.maxStaffUsers !== -1 && user.role !== 'super_admin') {
       const currentCount = await prisma.orgMember.count({ where: { orgId: validOrgId } });
       if (currentCount >= limits.maxStaffUsers) {
         throw new HttpError(400, `Your plan allows a maximum of ${limits.maxStaffUsers} team members. Upgrade to add more.`);

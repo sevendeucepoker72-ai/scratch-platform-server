@@ -65,7 +65,7 @@ apiKeyRouter.post('/create', requireAuth, async (req: Request, res: Response) =>
 
     const tier = org.subscriptionTier as SubscriptionTier;
     const limits = TIER_LIMITS[tier];
-    if (!limits.apiAccess) {
+    if (!limits.apiAccess && user.role !== 'super_admin') {
       throw new HttpError(403, 'API access is not available on your plan. Upgrade to Business or above.');
     }
 

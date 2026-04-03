@@ -126,6 +126,14 @@ app.post('/api/fix-distribution-tickets', async (req, res) => {
   res.json({ updated: result.count });
 });
 
+// Upgrade org subscription tier
+app.post('/api/upgrade-org', async (req, res) => {
+  const { secret, orgId, tier } = req.body as { secret: string; orgId: string; tier: string };
+  if (secret !== process.env.CLAIM_CODE_SECRET) { res.status(403).json({ error: 'Invalid secret' }); return; }
+  await prisma.organization.update({ where: { id: orgId }, data: { subscriptionTier: tier } });
+  res.json({ success: true, tier });
+});
+
 // Global error handler
 app.use((err: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const status = err.status ?? 500;

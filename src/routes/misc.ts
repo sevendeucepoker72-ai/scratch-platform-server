@@ -327,7 +327,7 @@ miscRouter.post('/custom-domain/register', requireAuth, async (req: Request, res
     }
 
     const tier = org.subscriptionTier as SubscriptionTier;
-    if (!TIER_LIMITS[tier].customDomain) {
+    if (!TIER_LIMITS[tier].customDomain && req.user!.role !== 'super_admin') {
       throw new HttpError(403, 'Custom domains are not available on your plan. Upgrade to Business or above.');
     }
 
