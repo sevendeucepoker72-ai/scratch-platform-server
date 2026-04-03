@@ -37,7 +37,7 @@ queryRouter.get('/tickets', requireAuth, async (req, res) => {
       where, select: TICKET_SAFE_SELECT,
       orderBy: { createdAt: 'desc' }, take: parseInt(lim ?? '50', 10),
     });
-    res.json(tickets.map(t => parseJsonFields(t as unknown as Record<string, unknown>)));
+    res.json(tickets.map(t => ({ ...parseJsonFields(t as unknown as Record<string, unknown>), ticketId: t.id })));
   } catch (err: any) {
     console.error('[query] tickets error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -50,7 +50,7 @@ queryRouter.get('/tickets/:id', requireAuth, async (req, res) => {
       where: { id: req.params.id }, select: TICKET_SAFE_SELECT,
     });
     if (!ticket) throw new HttpError(404, 'Ticket not found.');
-    res.json(parseJsonFields(ticket as unknown as Record<string, unknown>));
+    res.json({ ...parseJsonFields(ticket as unknown as Record<string, unknown>), ticketId: ticket.id });
   } catch (err: any) {
     if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
     res.status(500).json({ error: 'Internal server error' });
@@ -113,7 +113,7 @@ queryRouter.get('/claims', requireAuth, async (req, res) => {
     const claims = await prisma.claim.findMany({
       where, orderBy: { submittedAt: 'desc' }, take: 100,
     });
-    res.json(claims.map(c => parseJsonFields(c as unknown as Record<string, unknown>)));
+    res.json(claims.map(c => ({ ...parseJsonFields(c as unknown as Record<string, unknown>), claimId: c.id })));
   } catch (err: any) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -207,7 +207,7 @@ queryRouter.get('/campaigns', requireAuth, async (req, res) => {
     const campaigns = await prisma.campaign.findMany({
       where, orderBy: { createdAt: 'desc' },
     });
-    res.json(campaigns);
+    res.json(campaigns.map(c => ({ ...c, campaignId: c.id, oddsProfileId: c.oddsProfileId })));
   } catch (err: any) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -221,7 +221,7 @@ queryRouter.get('/odds-profiles', requireAuth, async (req, res) => {
     const where: Record<string, unknown> = {};
     if (orgId) where.orgId = orgId;
     const profiles = await prisma.oddsProfile.findMany({ where });
-    res.json(profiles.map(p => parseJsonFields(p as unknown as Record<string, unknown>)));
+    res.json(profiles.map(p => ({ ...parseJsonFields(p as unknown as Record<string, unknown>), profileId: p.id })));
   } catch (err: any) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -232,7 +232,7 @@ queryRouter.get('/odds-profiles', requireAuth, async (req, res) => {
 queryRouter.get('/venues', requireAuth, async (_req, res) => {
   try {
     const venues = await prisma.venue.findMany({ orderBy: { createdAt: 'desc' } });
-    res.json(venues);
+    res.json(venues.map(v => ({ ...v, venueId: v.id })));
   } catch (err: any) {
     res.status(500).json({ error: 'Internal server error' });
   }
