@@ -78,6 +78,17 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Parse JSON string fields from SQLite (venueIds, deck, revealedCardIds, etc.)
+function parseJsonFields(obj: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...obj };
+  for (const [key, value] of Object.entries(result)) {
+    if (typeof value === 'string' && (value.startsWith('[') || value.startsWith('{'))) {
+      try { result[key] = JSON.parse(value); } catch { /* keep as string */ }
+    }
+  }
+  return result;
+}
+
 // User profile endpoint
 app.get('/api/me', async (req, res) => {
   try {
@@ -87,7 +98,7 @@ app.get('/api/me', async (req, res) => {
 
     const user = await prisma.appUser.findUnique({ where: { authId: session.user.id } });
     if (!user) { res.status(404).json({ error: 'Profile not found' }); return; }
-    res.json(user);
+    res.json(parseJsonFields(user as unknown as Record<string, unknown>));
   } catch {
     res.status(401).json({ error: 'Invalid session' });
   }
@@ -126,4 +137,4 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-export { asyncHandler };
+export { asyncHandler, parseJsonFields };

@@ -5,6 +5,7 @@ import { Router } from 'express';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import { prisma } from '../db.js';
 import { HttpError } from '../lib/helpers.js';
+import { parseJsonFields } from '../index.js';
 
 export const queryRouter = Router();
 
@@ -238,7 +239,7 @@ queryRouter.get('/venues', requireAuth, async (_req, res) => {
 queryRouter.get('/users', requireAuth, requireRole('staff', 'admin', 'finance', 'super_admin'), async (_req, res) => {
   try {
     const users = await prisma.appUser.findMany({ orderBy: { createdAt: 'desc' } });
-    res.json(users);
+    res.json(users.map(u => parseJsonFields(u as unknown as Record<string, unknown>)));
   } catch (err: any) {
     res.status(500).json({ error: 'Internal server error' });
   }
