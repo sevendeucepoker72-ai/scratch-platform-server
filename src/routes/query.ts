@@ -160,6 +160,65 @@ queryRouter.get('/drawing-entries', requireAuth, async (req, res) => {
   }
 });
 
+// ── Drawing results history ──
+
+queryRouter.get('/drawing-results', requireAuth, async (req, res) => {
+  try {
+    const { campaignId } = req.query as Record<string, string>;
+    if (!campaignId) { res.status(400).json({ error: 'campaignId required' }); return; }
+    const results = await prisma.drawingResult.findMany({
+      where: { campaignId },
+      orderBy: { drawnAt: 'desc' },
+    });
+    res.json(results.map(r => ({
+      ...r,
+      allEntrants: typeof r.allEntrants === 'string' ? JSON.parse(r.allEntrants) : r.allEntrants,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+queryRouter.post('/drawing-results', requireAuth, async (req, res) => {
+  try {
+    const user = req.user!;
+    const { campaignId, orgId, winnerClaimId, winnerName, winnerEmail, winnerHand, winnerPrize, placement, totalEntries, allEntrants, note } = req.body;
+    if (!campaignId || !winnerClaimId || !winnerName) {
+      res.status(400).json({ error: 'campaignId, winnerClaimId, winnerName required' }); return;
+    }
+    const result = await prisma.drawingResult.create({
+      data: {
+        campaignId, orgId: orgId ?? user.orgId ?? null,
+        winnerClaimId, winnerName, winnerEmail: winnerEmail ?? '',
+        winnerHand: winnerHand ?? '', winnerPrize: winnerPrize ?? '',
+        placement: placement ?? 1, totalEntries: totalEntries ?? 0,
+        allEntrants: JSON.stringify(allEntrants ?? []),
+        drawnBy: user.id, note: note ?? null,
+      },
+    });
+    res.json(result);
+  } catch (err: any) {
+    console.error('[query] save drawing result error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Past drawing winners (for exclusion) ──
+
+queryRouter.get('/drawing-winners', requireAuth, async (req, res) => {
+  try {
+    const { campaignId } = req.query as Record<string, string>;
+    if (!campaignId) { res.status(400).json({ error: 'campaignId required' }); return; }
+    const results = await prisma.drawingResult.findMany({
+      where: { campaignId },
+      select: { winnerClaimId: true, winnerName: true, drawnAt: true },
+    });
+    res.json(results);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 queryRouter.get('/claims/:id', requireAuth, async (req, res) => {
   try {
     const claim = await prisma.claim.findUnique({ where: { id: req.params.id } });

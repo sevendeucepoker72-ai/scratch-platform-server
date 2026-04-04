@@ -572,6 +572,26 @@ model AnalyticsSummary {
   @@map("analytics_summaries")
 }
 
+model DrawingResult {
+  id           String   @id @default(cuid())
+  campaignId   String
+  orgId        String?
+  winnerClaimId String
+  winnerName   String
+  winnerEmail  String
+  winnerHand   String
+  winnerPrize  String
+  placement    Int      @default(1) // 1st, 2nd, 3rd
+  totalEntries Int      @default(0)
+  allEntrants  String   @default("[]") // JSON array of { name, email, claimId }
+  drawnBy      String   // user ID who pressed spin
+  drawnAt      DateTime @default(now())
+  note         String?
+
+  @@index([campaignId, drawnAt])
+  @@map("drawing_results")
+}
+
 model RateLimitBucket {
   id         String   @id // composite key string
   uid        String
