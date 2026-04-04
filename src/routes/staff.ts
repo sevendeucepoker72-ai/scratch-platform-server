@@ -351,13 +351,14 @@ router.post(
   async (req, res) => {
     try {
       const user = req.user!;
-      const { ticketId, freezeReason } = req.body;
+      const { ticketId, freezeReason, reason } = req.body;
+      const effectiveReason = freezeReason ?? reason;
 
       if (!ticketId || typeof ticketId !== 'string') {
         throw new HttpError(400, 'ticketId is required.');
       }
-      if (!freezeReason || typeof freezeReason !== 'string' || freezeReason.trim().length === 0) {
-        throw new HttpError(400, 'freezeReason is required.');
+      if (!effectiveReason || typeof effectiveReason !== 'string' || effectiveReason.trim().length === 0) {
+        throw new HttpError(400, 'Freeze reason is required.');
       }
 
       const result = await prisma.$transaction(async (tx) => {
@@ -382,7 +383,7 @@ router.post(
           where: { id: ticketId },
           data: {
             isFrozen: true,
-            freezeReason: freezeReason.trim(),
+            freezeReason: effectiveReason.trim(),
             frozenAt: now,
             frozenBy: user.id,
           },
@@ -397,7 +398,7 @@ router.post(
             targetId: ticketId,
             venueId: venueId,
             details: JSON.stringify(sanitizeDetails({
-              freezeReason: freezeReason.trim(),
+              freezeReason: effectiveReason.trim(),
             })),
           },
         });

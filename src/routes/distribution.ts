@@ -205,8 +205,11 @@ distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) 
 
     checkRateLimit(`anon-claim:${validId}`, 5);
 
-    if (!claimCode || typeof claimCode !== 'string') {
-      throw new HttpError(400, 'Claim code is required.');
+    if (!playerName || typeof playerName !== 'string' || playerName.trim().length < 2) {
+      throw new HttpError(400, 'Name is required (at least 2 characters).');
+    }
+    if (!playerEmail || typeof playerEmail !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(playerEmail)) {
+      throw new HttpError(400, 'A valid email address is required.');
     }
 
     const ticket = await prisma.ticket.findUnique({
