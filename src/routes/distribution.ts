@@ -220,7 +220,10 @@ distributionRouter.post('/anonymous-claim', async (req: Request, res: Response) 
 
     // IP lock check: only the original player can claim
     const clientIp = getClientIp(req);
-    if (ticket.lockedIp && ticket.lockedIp !== clientIp) {
+    if (!ticket.lockedIp) {
+      // Ticket was never scratched — lock to this IP now
+      await prisma.ticket.update({ where: { id: validId }, data: { lockedIp: clientIp } });
+    } else if (ticket.lockedIp !== clientIp) {
       throw new HttpError(403, 'This ticket is locked to another player.');
     }
 
@@ -308,7 +311,7 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
       throw new HttpError(400, `Ticket is already ${ticket.status}.`);
     }
 
-    // IP lock: bind ticket to first player's IP
+    // IP lock: bind ticket to first player's IP (atomic to prevent race condition)
     const clientIp = getClientIp(req);
     if (ticket.lockedIp && ticket.lockedIp !== clientIp) {
       throw new HttpError(403, 'This ticket is already in use by another player.');
@@ -327,7 +330,18 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
           throw new HttpError(403, 'You have already used a ticket for this campaign. One per person.');
         }
       }
-      await prisma.ticket.update({ where: { id: validId }, data: { lockedIp: clientIp } });
+      // Atomic lock: only update if still null (prevents race condition)
+      const lockResult = await prisma.ticket.updateMany({
+        where: { id: validId, lockedIp: null },
+        data: { lockedIp: clientIp },
+      });
+      // If no rows updated, someone else locked it first — re-check
+      if (lockResult.count === 0) {
+        const rechecked = await prisma.ticket.findUnique({ where: { id: validId } });
+        if (rechecked?.lockedIp && rechecked.lockedIp !== clientIp) {
+          throw new HttpError(403, 'This ticket is already in use by another player.');
+        }
+      }
     }
 
     const deck = (typeof ticket.deck === 'string' ? JSON.parse(ticket.deck) : ticket.deck) as string[];
