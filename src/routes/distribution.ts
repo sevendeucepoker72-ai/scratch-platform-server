@@ -67,6 +67,7 @@ distributionRouter.post(
       const scratchLimit = oddsProfile.scratchLimit ?? GAME_ENGINES[gameType]?.scratchLimit ?? 7;
 
       const tickets: Array<{ ticketId: string; scratchUrl: string; claimCode: string }> = [];
+      const batchId = crypto.randomBytes(8).toString('hex'); // unique ID for this batch
 
       for (let i = 0; i < qty; i++) {
         const claimCode = generateClaimCode();
@@ -95,6 +96,7 @@ distributionRouter.post(
             allowAnonymous: true, // distribution tickets always allow anonymous claims
             onePerIp: onePerIp === true,
             distributionBatch: true,
+            distributionBatchId: batchId,
             issuedBy: user.id,
           },
         });
@@ -317,17 +319,17 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
       throw new HttpError(403, 'This ticket is already in use by another player.');
     }
     if (!ticket.lockedIp) {
-      // One-per-IP check: if enabled, reject if this IP already used another ticket in the same campaign
-      if (ticket.onePerIp) {
+      // One-per-IP check: if enabled, reject if this IP already used another ticket in the same batch
+      if (ticket.onePerIp && ticket.distributionBatchId) {
         const existing = await prisma.ticket.findFirst({
           where: {
-            campaignId: ticket.campaignId,
+            distributionBatchId: ticket.distributionBatchId,
             lockedIp: clientIp,
             id: { not: validId },
           },
         });
         if (existing) {
-          throw new HttpError(403, 'You have already used a ticket for this campaign. One per person.');
+          throw new HttpError(403, 'You have already used a ticket from this batch. One per person.');
         }
       }
       // Atomic lock: only update if still null (prevents race condition)
