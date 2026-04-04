@@ -968,7 +968,7 @@ function csvEscape(value: string): string {
 router.post(
   '/delete-claim',
   requireAuth,
-  requireRole('admin', 'super_admin'),
+  requireRole('super_admin'),
   async (req, res) => {
     try {
       const user = req.user!;
