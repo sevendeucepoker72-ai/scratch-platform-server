@@ -109,12 +109,53 @@ queryRouter.get('/claims', requireAuth, async (req, res) => {
     if (status) where.status = status;
     if (venueId) where.venueId = venueId;
     if (venueIds) where.venueId = { in: venueIds.split(',') };
+    if (req.query.campaignId) where.campaignId = req.query.campaignId;
 
     const claims = await prisma.claim.findMany({
       where, orderBy: { submittedAt: 'desc' }, take: 100,
     });
     res.json(claims.map(c => ({ ...parseJsonFields(c as unknown as Record<string, unknown>), claimId: c.id })));
   } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── Drawing entries — claims qualifying for monthly drawing ──
+
+queryRouter.get('/drawing-entries', requireAuth, async (req, res) => {
+  try {
+    const { campaignId } = req.query as Record<string, string>;
+    if (!campaignId) { res.status(400).json({ error: 'campaignId required' }); return; }
+
+    const claims = await prisma.claim.findMany({
+      where: {
+        campaignId,
+        status: { in: ['pending_staff_approval', 'approved', 'redeemed'] },
+      },
+      orderBy: { submittedAt: 'desc' },
+    });
+
+    // Filter to claims where prizeLabel contains "drawing" (case-insensitive)
+    const entries = claims
+      .map(c => {
+        const ps = typeof c.prizeSnapshot === 'string' ? JSON.parse(c.prizeSnapshot) : c.prizeSnapshot;
+        return {
+          claimId: c.id,
+          ticketId: c.ticketId,
+          playerName: c.playerName ?? 'Unknown',
+          playerEmail: c.playerEmail ?? '',
+          playerPhone: c.playerPhone ?? '',
+          handRank: (ps as any)?.handRank ?? '',
+          prizeLabel: (ps as any)?.prizeLabel ?? '',
+          status: c.status,
+          submittedAt: c.submittedAt,
+        };
+      })
+      .filter(e => e.prizeLabel.toLowerCase().includes('drawing'));
+
+    res.json(entries);
+  } catch (err: any) {
+    console.error('[query] drawing-entries error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
