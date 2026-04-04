@@ -978,8 +978,9 @@ router.post(
       const claim = await prisma.claim.findUnique({ where: { id: claimId } });
       if (!claim) throw new HttpError(404, 'Claim not found.');
 
-      // Delete the claim and reset the ticket status back to finalized
+      // Delete redemption (if exists), claim, and reset ticket
       await prisma.$transaction(async (tx) => {
+        await tx.redemption.deleteMany({ where: { claimId } });
         await tx.claim.delete({ where: { id: claimId } });
         await tx.ticket.update({
           where: { id: claim.ticketId },
