@@ -963,4 +963,47 @@ function csvEscape(value: string): string {
   return value;
 }
 
+// ── DELETE CLAIM — admin+ ──
+
+router.post(
+  '/delete-claim',
+  requireAuth,
+  requireRole('admin', 'super_admin'),
+  async (req, res) => {
+    try {
+      const user = req.user!;
+      const { claimId } = req.body;
+      if (!claimId) throw new HttpError(400, 'claimId required.');
+
+      const claim = await prisma.claim.findUnique({ where: { id: claimId } });
+      if (!claim) throw new HttpError(404, 'Claim not found.');
+
+      // Delete the claim and reset the ticket status back to finalized
+      await prisma.$transaction(async (tx) => {
+        await tx.claim.delete({ where: { id: claimId } });
+        await tx.ticket.update({
+          where: { id: claim.ticketId },
+          data: { status: 'finalized', claimSubmittedAt: null, approvedAt: null, redeemedAt: null },
+        });
+      });
+
+      await writeAuditLog({
+        actorUserId: user.id,
+        actorRole: user.role,
+        actionType: 'claim_deleted',
+        targetType: 'claim',
+        targetId: claimId,
+        details: JSON.stringify({ ticketId: claim.ticketId, playerName: claim.playerName, status: claim.status }),
+      });
+
+      io.to(`claims:${claim.venueId}`).emit('claim:deleted', { claimId });
+      res.json({ success: true });
+    } catch (err) {
+      if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+      console.error('[staff] delete-claim error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
+);
+
 export { router as staffRouter };
