@@ -47,7 +47,7 @@ stripeRouter.post('/create-checkout', requireAuth, async (req: Request, res: Res
 
     const priceId = TIER_PRICE_IDS[tier];
     if (!priceId) {
-      throw new HttpError(500, `Stripe price not configured for tier: ${tier}`);
+      throw new HttpError(400, `Billing is not yet configured. Please contact support to set up ${tier} plan pricing.`);
     }
 
     // Create or retrieve Stripe customer

@@ -692,7 +692,7 @@ miscRouter.post('/admin/campaigns', requireAuth, requireRole('admin', 'super_adm
     const { venueId, name, oddsProfileId, isActive, ticketPrice, orgId } = req.body;
     if (!venueId || !name || !oddsProfileId) throw new HttpError(400, 'venueId, name, oddsProfileId required.');
     const campaign = await prisma.campaign.create({
-      data: { orgId: orgId ?? null, venueId, name, oddsProfileId, isActive: isActive ?? true, ticketPrice: ticketPrice ?? 0, createdBy: req.user!.id },
+      data: { orgId: orgId ?? req.user!.orgId ?? null, venueId, name, oddsProfileId, isActive: isActive ?? true, ticketPrice: ticketPrice ?? 0, createdBy: req.user!.id },
     });
     res.json({ campaign });
   } catch (err) {

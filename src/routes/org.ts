@@ -32,12 +32,13 @@ orgRouter.post('/venues/create', requireAuth, async (req: Request, res: Response
 
 orgRouter.post('/venues/update', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { venueId, isActive, name, address } = req.body;
+    const { venueId, isActive, name, address, orgId } = req.body;
     if (!venueId) throw new HttpError(400, 'venueId required.');
     const data: Record<string, unknown> = {};
     if (isActive !== undefined) data.isActive = isActive;
     if (name !== undefined) data.name = name;
     if (address !== undefined) data.address = address;
+    if (orgId !== undefined) data.orgId = orgId;
     const venue = await prisma.venue.update({ where: { id: venueId }, data });
     res.json({ venue });
   } catch (err) {

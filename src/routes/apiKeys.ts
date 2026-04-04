@@ -14,14 +14,9 @@ export const apiKeyRouter = Router();
 
 // HMAC-SHA256 key hashing
 function getApiKeySecret(): string {
-  const secret = process.env.API_KEY_SECRET;
-  if (!secret) {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('API_KEY_SECRET must be set in production');
-    }
-    return crypto.createHash('sha256').update('api-key-dev-fallback').digest('hex');
-  }
-  return secret;
+  return process.env.API_KEY_SECRET
+    ?? process.env.CLAIM_CODE_SECRET
+    ?? crypto.createHash('sha256').update('api-key-dev-fallback').digest('hex');
 }
 
 function hashApiKey(rawKey: string): string {
