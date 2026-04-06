@@ -512,7 +512,9 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
       prizeSnapshot,
     });
 
-    res.json({ ticketId: validId, prizeSnapshot });
+    // For poker_pick: include full deck so frontend can reveal all 52 cards after finalize
+    const fullDeck = gameType === 'poker_pick' ? deck : undefined;
+    res.json({ ticketId: validId, prizeSnapshot, fullDeck });
   } catch (err) {
     if (err instanceof HttpError) {
       res.status(err.status).json({ error: err.message });
