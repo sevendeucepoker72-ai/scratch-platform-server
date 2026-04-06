@@ -149,3 +149,42 @@ ${redemptionNote ? `<p><strong>Staff note:</strong> ${escapeHtml(redemptionNote)
     text: `Prize paid out!\nHand: ${handRank}\nAmount: ${prizeFormatted}\nClaim ID: ${claimId}`,
   });
 }
+
+// ── Distribution ticket email (bulk distribution) ──
+
+export async function sendDistributionTicketEmail(params: {
+  toEmail: string;
+  toName: string;
+  scratchUrl: string;
+  campaignName: string;
+  orgName: string;
+  orgLogo: string | null;
+}): Promise<void> {
+  const { toEmail, toName, scratchUrl, campaignName, orgName, orgLogo } = params;
+  const greeting = toName ? `Hi ${escapeHtml(toName)},` : 'Hi there,';
+
+  const body = `
+    ${orgLogo ? `<div style="text-align:center;margin-bottom:16px"><img src="${escapeHtml(orgLogo)}" alt="${escapeHtml(orgName)}" style="max-height:60px"/></div>` : ''}
+    <h2 style="text-align:center">You have a scratch ticket!</h2>
+    <p>${greeting}</p>
+    <p><strong>${escapeHtml(orgName)}</strong> sent you a ScratchPoker ticket for <strong>${escapeHtml(campaignName)}</strong>.</p>
+    <p>Tap the button below to scratch your card and see if you've won!</p>
+    <div style="text-align:center;margin:32px 0">
+      <a href="${escapeHtml(scratchUrl)}" class="btn btn-success" style="display:inline-block;background:#3fb950;color:#000;padding:16px 36px;border-radius:8px;font-weight:700;text-decoration:none;font-size:18px">
+        🎴 Scratch Your Card
+      </a>
+    </div>
+    <div class="alert alert-info">
+      <strong>One-time use:</strong> This ticket is locked to the first device that opens it. Don't share the link.
+    </div>
+    <p style="font-size:12px;color:#8b949e;margin-top:24px">If the button doesn't work, copy this link: ${escapeHtml(scratchUrl)}</p>
+  `;
+
+  await sendEmail({
+    to: { email: toEmail, name: toName || toEmail },
+    from: { email: FROM_EMAIL(), name: orgName || FROM_NAME() },
+    subject: `🎴 You have a scratch ticket from ${orgName}!`,
+    html: wrapHtml(body, 'Your Scratch Ticket'),
+    text: `${greeting}\n\n${orgName} sent you a scratch ticket for ${campaignName}.\n\nTap to play: ${scratchUrl}\n\nThis ticket is one-time use - don't share the link.`,
+  });
+}

@@ -38,7 +38,7 @@ distributionRouter.post(
   requireRole('staff', 'admin', 'super_admin'),
   async (req: Request, res: Response) => {
     try {
-      const { campaignId, quantity, count, venueId, orgId, onePerIp } = req.body;
+      const { campaignId, quantity, count, venueId, orgId, onePerIp, name: batchName, expiresAt } = req.body;
       const user = req.user!;
       const qty = quantity ?? count;
 
@@ -66,8 +66,26 @@ distributionRouter.post(
       const oddsProfile = campaign.oddsProfile;
       const scratchLimit = oddsProfile.scratchLimit ?? GAME_ENGINES[gameType]?.scratchLimit ?? 7;
 
+      // Create the DistributionBatch record first
+      const finalBatchName = (typeof batchName === 'string' && batchName.trim())
+        ? batchName.trim()
+        : `${campaign.name} - ${new Date().toLocaleDateString()}`;
+      const distBatch = await prisma.distributionBatch.create({
+        data: {
+          campaignId: campaign.id,
+          venueId: campaign.venueId,
+          orgId: effectiveOrgId ?? null,
+          name: finalBatchName,
+          quantity: qty,
+          onePerIp: onePerIp === true,
+          expiresAt: expiresAt ? new Date(expiresAt) : null,
+          issuedBy: user.id,
+          status: 'active',
+        },
+      });
+
       const tickets: Array<{ ticketId: string; scratchUrl: string; claimCode: string }> = [];
-      const batchId = crypto.randomBytes(8).toString('hex'); // unique ID for this batch
+      const batchId = distBatch.id;
 
       for (let i = 0; i < qty; i++) {
         const claimCode = generateClaimCode();
@@ -121,7 +139,7 @@ distributionRouter.post(
         issuedBy: user.id,
       });
 
-      res.json({ tickets });
+      res.json({ tickets, batchId, batchName: finalBatchName, batch: distBatch });
     } catch (err) {
       if (err instanceof HttpError) {
         res.status(err.status).json({ error: err.message });
@@ -523,6 +541,295 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
       return;
     }
     console.error('[distribution] public-finalize error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── BATCH MANAGEMENT ENDPOINTS ────────────────────────────────
+
+distributionRouter.get('/batches', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId, campaignId } = req.query as Record<string, string>;
+    const where: Record<string, unknown> = {};
+    if (orgId) where.orgId = orgId;
+    else if (user.orgId) where.orgId = user.orgId;
+    if (campaignId) where.campaignId = campaignId;
+
+    const batches = await prisma.distributionBatch.findMany({ where, orderBy: { issuedAt: 'desc' }, take: 200 });
+    const batchIds = batches.map(b => b.id);
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: { in: batchIds } },
+      select: { distributionBatchId: true, status: true },
+    });
+    const stats: Record<string, Record<string, number>> = {};
+    for (const t of tickets) {
+      const bid = t.distributionBatchId!;
+      if (!stats[bid]) stats[bid] = { issued: 0, in_progress: 0, finalized: 0, claimed: 0, redeemed: 0, frozen: 0 };
+      const s = (t.status === 'pending_staff_approval' || t.status === 'approved') ? 'claimed' : t.status;
+      stats[bid][s] = (stats[bid][s] ?? 0) + 1;
+    }
+    res.json(batches.map(b => ({ ...b, stats: stats[b.id] ?? { issued: 0, in_progress: 0, finalized: 0, claimed: 0, redeemed: 0, frozen: 0 } })));
+  } catch (err) {
+    console.error('[distribution] list batches error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.get('/batches/:id', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: batch.id },
+      select: {
+        id: true, status: true, isFrozen: true, lockedIp: true,
+        revealedCardIds: true, prizeSnapshot: true,
+        createdAt: true, finalizedAt: true, claimSubmittedAt: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+    const venue = await prisma.venue.findUnique({ where: { id: batch.venueId } });
+    res.json({
+      batch, campaign, venue,
+      tickets: tickets.map(t => ({
+        ...t,
+        scratchUrl: `${APP_URL}/scratch/${t.id}`,
+        prizeSnapshot: typeof t.prizeSnapshot === 'string' ? JSON.parse(t.prizeSnapshot) : t.prizeSnapshot,
+        revealedCount: (typeof t.revealedCardIds === 'string' ? JSON.parse(t.revealedCardIds) : t.revealedCardIds)?.length ?? 0,
+      })),
+    });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[distribution] get batch error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/batches/:id/void', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    if (batch.status === 'voided') throw new HttpError(400, 'Batch already voided.');
+    const result = await prisma.ticket.updateMany({
+      where: { distributionBatchId: batch.id, status: { in: ['issued', 'in_progress'] } },
+      data: { isFrozen: true, freezeReason: 'Batch voided by admin' },
+    });
+    await prisma.distributionBatch.update({
+      where: { id: batch.id },
+      data: { status: 'voided', voidedAt: new Date(), voidedBy: user.id },
+    });
+    await writeAuditLog({
+      actorUserId: user.id, actorRole: user.role,
+      actionType: 'distribution_batch_voided',
+      targetType: 'distribution_batch', targetId: batch.id,
+      details: { ticketsFrozen: result.count, batchName: batch.name },
+    });
+    res.json({ success: true, ticketsFrozen: result.count });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[distribution] void batch error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.get('/batches/:id/csv', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: batch.id },
+      select: { id: true, status: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    const rows = ['scratchUrl,status,issuedAt'];
+    for (const t of tickets) rows.push(`${APP_URL}/scratch/${t.id},${t.status},${t.createdAt.toISOString()}`);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="batch-${batch.id}.csv"`);
+    res.send(rows.join('\n'));
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.get('/batches/:id/pdf', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const PDFDocument = (await import('pdfkit')).default;
+    const QRCode = await import('qrcode');
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: batch.id },
+      select: { id: true, status: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+    const venue = await prisma.venue.findUnique({ where: { id: batch.venueId } });
+
+    const doc = new PDFDocument({ size: 'LETTER', margin: 36 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="batch-${batch.id}-qrcodes.pdf"`);
+    doc.pipe(res);
+
+    doc.fontSize(20).font('Helvetica-Bold').text(batch.name, { align: 'center' });
+    doc.fontSize(11).font('Helvetica').text(`${campaign?.name ?? ''} - ${venue?.name ?? ''}`, { align: 'center' });
+    doc.fontSize(9).text(`${tickets.length} tickets - Issued ${batch.issuedAt.toLocaleDateString()}`, { align: 'center' });
+    doc.moveDown(1);
+
+    const cols = 2, rows = 5;
+    const cardWidth = (612 - 72 - 18) / cols;
+    const cardHeight = (792 - 200) / rows;
+
+    let i = 0;
+    for (const ticket of tickets) {
+      const idx = i % (cols * rows);
+      const col = idx % cols;
+      const row = Math.floor(idx / cols);
+
+      if (i > 0 && idx === 0) doc.addPage();
+
+      const x = 36 + col * (cardWidth + 18);
+      const y = (i < (cols * rows) ? 130 : 36) + row * cardHeight;
+
+      doc.rect(x, y, cardWidth, cardHeight - 12).stroke('#aaaaaa');
+
+      const url = `${APP_URL}/scratch/${ticket.id}`;
+      const qrDataUrl = await QRCode.toDataURL(url, { width: 200, margin: 1 });
+      const qrSize = Math.min(cardWidth - 40, cardHeight - 80);
+      doc.image(Buffer.from(qrDataUrl.split(',')[1], 'base64'),
+        x + (cardWidth - qrSize) / 2, y + 10, { width: qrSize });
+
+      doc.fontSize(9).font('Helvetica-Bold').text(`Ticket #${i + 1}`, x + 4, y + qrSize + 16, { width: cardWidth - 8, align: 'center' });
+      doc.fontSize(7).font('Helvetica').fillColor('#666').text(url.replace(/^https?:\/\//, ''), x + 4, y + qrSize + 28, { width: cardWidth - 8, align: 'center' });
+      doc.fillColor('#000');
+      i++;
+    }
+    doc.end();
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[distribution] pdf error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/batches/:id/send-email', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { sendDistributionTicketEmail } = await import('../lib/email.js');
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    const { recipients } = req.body as { recipients: Array<{ email: string; name?: string }> };
+    if (!Array.isArray(recipients) || recipients.length === 0) throw new HttpError(400, 'recipients required.');
+
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: batch.id, status: 'issued', isFrozen: false },
+      select: { id: true }, orderBy: { createdAt: 'asc' }, take: recipients.length,
+    });
+    if (tickets.length < recipients.length) throw new HttpError(400, `Only ${tickets.length} unscratched tickets available.`);
+
+    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+    const org = batch.orgId ? await prisma.organization.findUnique({ where: { id: batch.orgId } }) : null;
+
+    let sent = 0, failed = 0;
+    for (let i = 0; i < recipients.length; i++) {
+      try {
+        await sendDistributionTicketEmail({
+          toEmail: recipients[i].email,
+          toName: recipients[i].name ?? '',
+          scratchUrl: `${APP_URL}/scratch/${tickets[i].id}`,
+          campaignName: campaign?.name ?? 'Scratch Card',
+          orgName: org?.name ?? 'ScratchPoker',
+          orgLogo: org?.logoUrl ?? null,
+        });
+        sent++;
+      } catch { failed++; }
+    }
+    res.json({ sent, failed, total: recipients.length });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[distribution] send-email error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/batches/:id/send-sms', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
+      throw new HttpError(503, 'SMS not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.');
+    }
+    const twilio = (await import('twilio')).default(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    const { recipients } = req.body as { recipients: Array<{ phone: string; name?: string }> };
+    if (!Array.isArray(recipients) || recipients.length === 0) throw new HttpError(400, 'recipients required.');
+
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: batch.id, status: 'issued', isFrozen: false },
+      select: { id: true }, orderBy: { createdAt: 'asc' }, take: recipients.length,
+    });
+    if (tickets.length < recipients.length) throw new HttpError(400, `Only ${tickets.length} unscratched tickets available.`);
+    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+
+    let sent = 0, failed = 0;
+    for (let i = 0; i < recipients.length; i++) {
+      const url = `${APP_URL}/scratch/${tickets[i].id}`;
+      const msg = `${recipients[i].name ? recipients[i].name + ', here is' : 'Here is'} your scratch ticket: ${url} - ${campaign?.name ?? 'ScratchPoker'}`;
+      try {
+        await twilio.messages.create({ to: recipients[i].phone, from: process.env.TWILIO_PHONE_NUMBER!, body: msg });
+        sent++;
+      } catch { failed++; }
+    }
+    res.json({ sent, failed, total: recipients.length });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[distribution] send-sms error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── DISTRIBUTION TEMPLATES ────────────────────────────────
+
+distributionRouter.get('/templates', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId } = req.query as Record<string, string>;
+    const finalOrgId = orgId ?? user.orgId;
+    if (!finalOrgId) { res.json([]); return; }
+    const templates = await prisma.distributionTemplate.findMany({
+      where: { orgId: finalOrgId }, orderBy: { createdAt: 'desc' },
+    });
+    res.json(templates);
+  } catch {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/templates', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { name, campaignId, venueId, quantity, onePerIp, orgId } = req.body;
+    if (!name) throw new HttpError(400, 'Template name required.');
+    const tmpl = await prisma.distributionTemplate.create({
+      data: {
+        orgId: orgId ?? user.orgId ?? '',
+        name, campaignId: campaignId ?? null, venueId: venueId ?? null,
+        quantity: quantity ?? 10, onePerIp: onePerIp === true, createdBy: user.id,
+      },
+    });
+    res.json(tmpl);
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.delete('/templates/:id', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    await prisma.distributionTemplate.delete({ where: { id: req.params.id } });
+    res.json({ success: true });
+  } catch {
     res.status(500).json({ error: 'Internal server error' });
   }
 });

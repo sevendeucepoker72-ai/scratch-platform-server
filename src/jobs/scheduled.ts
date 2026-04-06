@@ -2,6 +2,38 @@ import cron from 'node-cron';
 import { prisma } from '../db.js';
 
 export function startScheduledJobs() {
+  // Expire batches whose expiresAt has passed — every 5 minutes
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      const result = await prisma.distributionBatch.updateMany({
+        where: {
+          status: 'active',
+          expiresAt: { lte: new Date() },
+        },
+        data: { status: 'expired' },
+      });
+      if (result.count > 0) {
+        console.log(`[scheduled] Expired ${result.count} distribution batches`);
+        // Also freeze unscratched tickets in expired batches
+        const expired = await prisma.distributionBatch.findMany({
+          where: { status: 'expired', expiresAt: { lte: new Date() } },
+          select: { id: true },
+        });
+        if (expired.length > 0) {
+          await prisma.ticket.updateMany({
+            where: {
+              distributionBatchId: { in: expired.map(b => b.id) },
+              status: { in: ['issued', 'in_progress'] },
+            },
+            data: { isFrozen: true, freezeReason: 'Batch expired' },
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[scheduled] expireBatches error:', err);
+    }
+  });
+
   // Expire stale tickets — every hour
   cron.schedule('0 * * * *', async () => {
     try {
