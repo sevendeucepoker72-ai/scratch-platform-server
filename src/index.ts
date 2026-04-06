@@ -73,6 +73,15 @@ app.use('/api/api-keys', apiKeyRouter);
 app.use('/api', miscRouter);
 app.use('/api/query', queryRouter);
 
+// Short URL redirect
+app.get('/s/:code', asyncHandler(async (req, res) => {
+  const code = req.params.code;
+  const row = await prisma.shortUrl.findUnique({ where: { id: code } });
+  if (!row) { res.status(404).send('Short link not found'); return; }
+  prisma.shortUrl.update({ where: { id: code }, data: { hitCount: { increment: 1 } } }).catch(() => {});
+  res.redirect(302, row.targetUrl);
+}));
+
 // Health check
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });

@@ -30,6 +30,53 @@ function getClientIp(req: Request): string {
   return (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? 'unknown';
 }
 
+// Generate a 6-char base62 short URL code
+const BASE62 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+function generateShortCode(): string {
+  let code = '';
+  const bytes = crypto.randomBytes(6);
+  for (let i = 0; i < 6; i++) code += BASE62[bytes[i] % 62];
+  return code;
+}
+
+// Get or create a short URL for a target — returns the short URL string
+async function getOrCreateShortUrl(targetUrl: string): Promise<string> {
+  // Reuse existing short code for the same target if exists
+  const existing = await prisma.shortUrl.findFirst({ where: { targetUrl } });
+  if (existing) return `${APP_URL}/s/${existing.id}`;
+
+  // Generate unique code (retry up to 5 times on collision)
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateShortCode();
+    try {
+      await prisma.shortUrl.create({ data: { id: code, targetUrl } });
+      return `${APP_URL}/s/${code}`;
+    } catch {
+      // Collision, try again
+    }
+  }
+  // Fallback to original URL if all attempts fail
+  return targetUrl;
+}
+
+// Apply merge tag substitution: {{firstName}}, {{name}}, {{campaign}}, {{venue}}, {{url}}, {{org}}
+function applyMergeTags(template: string, vars: {
+  firstName?: string;
+  name?: string;
+  campaign?: string;
+  venue?: string;
+  url?: string;
+  org?: string;
+}): string {
+  return template
+    .replace(/\{\{\s*firstName\s*\}\}/gi, vars.firstName ?? '')
+    .replace(/\{\{\s*name\s*\}\}/gi, vars.name ?? '')
+    .replace(/\{\{\s*campaign\s*\}\}/gi, vars.campaign ?? '')
+    .replace(/\{\{\s*venue\s*\}\}/gi, vars.venue ?? '')
+    .replace(/\{\{\s*url\s*\}\}/gi, vars.url ?? '')
+    .replace(/\{\{\s*org\s*\}\}/gi, vars.org ?? '');
+}
+
 // ── POST /issue-batch — Create N distribution tickets (admin+) ──
 
 distributionRouter.post(
@@ -38,7 +85,7 @@ distributionRouter.post(
   requireRole('staff', 'admin', 'super_admin'),
   async (req: Request, res: Response) => {
     try {
-      const { campaignId, quantity, count, venueId, orgId, onePerIp, name: batchName, expiresAt } = req.body;
+      const { campaignId, quantity, count, venueId, orgId, onePerIp, name: batchName, expiresAt, activatesAt, tags, notes } = req.body;
       const user = req.user!;
       const qty = quantity ?? count;
 
@@ -79,6 +126,9 @@ distributionRouter.post(
           quantity: qty,
           onePerIp: onePerIp === true,
           expiresAt: expiresAt ? new Date(expiresAt) : null,
+          activatesAt: activatesAt ? new Date(activatesAt) : null,
+          tags: Array.isArray(tags) ? JSON.stringify(tags) : '[]',
+          notes: typeof notes === 'string' ? notes : null,
           issuedBy: user.id,
           status: 'active',
         },
@@ -171,6 +221,14 @@ distributionRouter.post('/public-ticket', async (req: Request, res: Response) =>
     if (!ticket) throw new HttpError(404, 'Ticket not found.');
     if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
 
+    // Look up batch for time-window info
+    const batchInfo = ticket.distributionBatchId
+      ? await prisma.distributionBatch.findUnique({ where: { id: ticket.distributionBatchId } })
+      : null;
+    const notActiveUntil = batchInfo?.activatesAt && batchInfo.activatesAt > new Date()
+      ? batchInfo.activatesAt.toISOString()
+      : null;
+
     // Delivery tracking: mark as opened/scratched when ticket is loaded
     if (ticket.distributionBatchId) {
       void prisma.deliveryLog.updateMany({
@@ -211,6 +269,8 @@ distributionRouter.post('/public-ticket', async (req: Request, res: Response) =>
         prizes: typeof ticket.campaign.oddsProfile.prizes === 'string' ? JSON.parse(ticket.campaign.oddsProfile.prizes) : ticket.campaign.oddsProfile.prizes,
         scratchLimit: ticket.campaign.oddsProfile.scratchLimit,
       },
+      notActiveUntil,
+      expiresAt: batchInfo?.expiresAt?.toISOString() ?? null,
     });
   } catch (err) {
     if (err instanceof HttpError) {
@@ -340,6 +400,14 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
     if (ticket.isFrozen) throw new HttpError(403, 'Ticket is frozen.');
     if (ticket.status === 'finalized' || ticket.status === 'claimed' || ticket.status === 'expired') {
       throw new HttpError(400, `Ticket is already ${ticket.status}.`);
+    }
+
+    // Time-window enforcement: check batch.activatesAt
+    if (ticket.distributionBatchId) {
+      const batchRow = await prisma.distributionBatch.findUnique({ where: { id: ticket.distributionBatchId } });
+      if (batchRow?.activatesAt && batchRow.activatesAt > new Date()) {
+        throw new HttpError(403, `This ticket is not yet active. Available at ${batchRow.activatesAt.toISOString()}`);
+      }
     }
 
     // Delivery tracking: mark as scratched on first reveal
@@ -566,14 +634,23 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
 distributionRouter.get('/batches', requireAuth, async (req: Request, res: Response) => {
   try {
     const user = req.user!;
-    const { orgId, campaignId } = req.query as Record<string, string>;
+    const { orgId, campaignId, tag, includeArchived } = req.query as Record<string, string>;
     const where: Record<string, unknown> = {};
     if (orgId) where.orgId = orgId;
     else if (user.orgId) where.orgId = user.orgId;
     if (campaignId) where.campaignId = campaignId;
+    if (includeArchived !== 'true') where.archived = false;
 
-    const batches = await prisma.distributionBatch.findMany({ where, orderBy: { issuedAt: 'desc' }, take: 200 });
-    const batchIds = batches.map(b => b.id);
+    const batches = await prisma.distributionBatch.findMany({ where, orderBy: { issuedAt: 'desc' }, take: 500 });
+
+    // Filter by tag client-side (SQLite doesn't support JSON contains)
+    const filtered = tag
+      ? batches.filter(b => {
+          try { return (JSON.parse(b.tags) as string[]).includes(tag); } catch { return false; }
+        })
+      : batches;
+
+    const batchIds = filtered.map(b => b.id);
     const tickets = await prisma.ticket.findMany({
       where: { distributionBatchId: { in: batchIds } },
       select: { distributionBatchId: true, status: true },
@@ -585,7 +662,30 @@ distributionRouter.get('/batches', requireAuth, async (req: Request, res: Respon
       const s = (t.status === 'pending_staff_approval' || t.status === 'approved') ? 'claimed' : t.status;
       stats[bid][s] = (stats[bid][s] ?? 0) + 1;
     }
-    res.json(batches.map(b => ({ ...b, stats: stats[b.id] ?? { issued: 0, in_progress: 0, finalized: 0, claimed: 0, redeemed: 0, frozen: 0 } })));
+
+    // Cost stats: count delivery logs per batch by channel
+    const logs = await prisma.deliveryLog.groupBy({
+      by: ['batchId', 'channel'],
+      where: { batchId: { in: batchIds }, status: { in: ['sent', 'delivered', 'opened', 'scratched'] } },
+      _count: { _all: true },
+    });
+    const costs: Record<string, { emailCount: number; smsCount: number; estimatedCostCents: number }> = {};
+    for (const l of logs) {
+      if (!costs[l.batchId]) costs[l.batchId] = { emailCount: 0, smsCount: 0, estimatedCostCents: 0 };
+      if (l.channel === 'email') costs[l.batchId].emailCount = l._count._all;
+      if (l.channel === 'sms') costs[l.batchId].smsCount = l._count._all;
+    }
+    for (const k of Object.keys(costs)) {
+      // $0.0006/email, $0.0075/sms => 0.06 cents per email, 0.75 cents per SMS
+      costs[k].estimatedCostCents = Math.round(costs[k].emailCount * 0.06 + costs[k].smsCount * 0.75);
+    }
+
+    res.json(filtered.map(b => ({
+      ...b,
+      tags: typeof b.tags === 'string' ? (() => { try { return JSON.parse(b.tags); } catch { return []; } })() : b.tags,
+      stats: stats[b.id] ?? { issued: 0, in_progress: 0, finalized: 0, claimed: 0, redeemed: 0, frozen: 0 },
+      cost: costs[b.id] ?? { emailCount: 0, smsCount: 0, estimatedCostCents: 0 },
+    })));
   } catch (err) {
     console.error('[distribution] list batches error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -608,7 +708,11 @@ distributionRouter.get('/batches/:id', requireAuth, async (req: Request, res: Re
     const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
     const venue = await prisma.venue.findUnique({ where: { id: batch.venueId } });
     res.json({
-      batch, campaign, venue,
+      batch: {
+        ...batch,
+        tags: typeof batch.tags === 'string' ? (() => { try { return JSON.parse(batch.tags); } catch { return []; } })() : batch.tags,
+      },
+      campaign, venue,
       tickets: tickets.map(t => ({
         ...t,
         scratchUrl: `${APP_URL}/scratch/${t.id}`,
@@ -671,6 +775,16 @@ distributionRouter.get('/batches/:id/csv', requireAuth, async (req: Request, res
   }
 });
 
+// Layouts: grid10 (2x5, default), grid1 (1 per page big), grid20 (4x5 small),
+// business_card (2x5 of 2"x3.5"), sticker_30 (3x10 of Avery 5160 1"x2.625")
+const PDF_LAYOUTS: Record<string, { cols: number; rows: number; showFooter: boolean; showHeader: boolean; cellWidthIn: number; cellHeightIn: number }> = {
+  grid10: { cols: 2, rows: 5, showFooter: true, showHeader: true, cellWidthIn: 4, cellHeightIn: 2.6 },
+  grid1: { cols: 1, rows: 1, showFooter: true, showHeader: true, cellWidthIn: 7, cellHeightIn: 9 },
+  grid20: { cols: 4, rows: 5, showFooter: true, showHeader: true, cellWidthIn: 2, cellHeightIn: 1.8 },
+  business_card: { cols: 2, rows: 5, showFooter: false, showHeader: false, cellWidthIn: 3.5, cellHeightIn: 2 },
+  sticker_30: { cols: 3, rows: 10, showFooter: false, showHeader: false, cellWidthIn: 2.625, cellHeightIn: 1 },
+};
+
 distributionRouter.get('/batches/:id/pdf', requireAuth, async (req: Request, res: Response) => {
   try {
     const PDFDocument = (await import('pdfkit')).default;
@@ -685,42 +799,71 @@ distributionRouter.get('/batches/:id/pdf', requireAuth, async (req: Request, res
     const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
     const venue = await prisma.venue.findUnique({ where: { id: batch.venueId } });
 
+    const layoutKey = (req.query.layout as string) ?? 'grid10';
+    const layout = PDF_LAYOUTS[layoutKey] ?? PDF_LAYOUTS.grid10;
+    const PT_PER_IN = 72;
+
     const doc = new PDFDocument({ size: 'LETTER', margin: 36 });
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="batch-${batch.id}-qrcodes.pdf"`);
+    res.setHeader('Content-Disposition', `attachment; filename="batch-${batch.id}-${layoutKey}.pdf"`);
     doc.pipe(res);
 
-    doc.fontSize(20).font('Helvetica-Bold').text(batch.name, { align: 'center' });
-    doc.fontSize(11).font('Helvetica').text(`${campaign?.name ?? ''} - ${venue?.name ?? ''}`, { align: 'center' });
-    doc.fontSize(9).text(`${tickets.length} tickets - Issued ${batch.issuedAt.toLocaleDateString()}`, { align: 'center' });
-    doc.moveDown(1);
+    let headerHeight = 0;
+    if (layout.showHeader) {
+      doc.fontSize(20).font('Helvetica-Bold').text(batch.name, { align: 'center' });
+      doc.fontSize(11).font('Helvetica').text(`${campaign?.name ?? ''} - ${venue?.name ?? ''}`, { align: 'center' });
+      doc.fontSize(9).text(`${tickets.length} tickets - Issued ${batch.issuedAt.toLocaleDateString()}`, { align: 'center' });
+      doc.moveDown(1);
+      headerHeight = 90;
+    }
 
-    const cols = 2, rows = 5;
-    const cardWidth = (612 - 72 - 18) / cols;
-    const cardHeight = (792 - 200) / rows;
+    const cellW = layout.cellWidthIn * PT_PER_IN;
+    const cellH = layout.cellHeightIn * PT_PER_IN;
+    const pageW = 612, pageH = 792;
+    const usableW = layout.cols * cellW;
+    const startX = (pageW - usableW) / 2;
 
     let i = 0;
     for (const ticket of tickets) {
-      const idx = i % (cols * rows);
-      const col = idx % cols;
-      const row = Math.floor(idx / cols);
+      const perPage = layout.cols * layout.rows;
+      const idx = i % perPage;
+      const col = idx % layout.cols;
+      const row = Math.floor(idx / layout.cols);
 
-      if (i > 0 && idx === 0) doc.addPage();
+      if (i > 0 && idx === 0) {
+        doc.addPage();
+        if (layout.showHeader) {
+          doc.fontSize(14).font('Helvetica-Bold').text(batch.name, { align: 'center' });
+          doc.moveDown(0.5);
+        }
+      }
 
-      const x = 36 + col * (cardWidth + 18);
-      const y = (i < (cols * rows) ? 130 : 36) + row * cardHeight;
+      const startY = (i < perPage && layout.showHeader) ? headerHeight + 36 : 36;
+      const x = startX + col * cellW;
+      const y = startY + row * cellH;
 
-      doc.rect(x, y, cardWidth, cardHeight - 12).stroke('#aaaaaa');
+      doc.rect(x, y, cellW - 6, cellH - 6).stroke('#aaaaaa');
 
-      const url = `${APP_URL}/scratch/${ticket.id}`;
-      const qrDataUrl = await QRCode.toDataURL(url, { width: 200, margin: 1 });
-      const qrSize = Math.min(cardWidth - 40, cardHeight - 80);
+      const longUrl = `${APP_URL}/scratch/${ticket.id}`;
+      const shortUrl = await getOrCreateShortUrl(longUrl);
+      const qrTarget = layoutKey === 'sticker_30' || layoutKey === 'business_card' ? shortUrl : longUrl;
+      const qrDataUrl = await QRCode.toDataURL(qrTarget, { width: 300, margin: 1 });
+      const qrSize = Math.min(cellW - 16, cellH - (layout.showFooter ? 36 : 16));
       doc.image(Buffer.from(qrDataUrl.split(',')[1], 'base64'),
-        x + (cardWidth - qrSize) / 2, y + 10, { width: qrSize });
+        x + (cellW - qrSize) / 2, y + 6, { width: qrSize });
 
-      doc.fontSize(9).font('Helvetica-Bold').text(`Ticket #${i + 1}`, x + 4, y + qrSize + 16, { width: cardWidth - 8, align: 'center' });
-      doc.fontSize(7).font('Helvetica').fillColor('#666').text(url.replace(/^https?:\/\//, ''), x + 4, y + qrSize + 28, { width: cardWidth - 8, align: 'center' });
-      doc.fillColor('#000');
+      if (layout.showFooter) {
+        const labelY = y + qrSize + 8;
+        doc.fontSize(layoutKey === 'grid20' ? 7 : 9).font('Helvetica-Bold').text(
+          `Ticket #${i + 1}`, x + 4, labelY,
+          { width: cellW - 8, align: 'center' }
+        );
+        doc.fontSize(layoutKey === 'grid20' ? 6 : 7).font('Helvetica').fillColor('#666').text(
+          shortUrl.replace(/^https?:\/\//, ''), x + 4, labelY + (layoutKey === 'grid20' ? 8 : 12),
+          { width: cellW - 8, align: 'center' }
+        );
+        doc.fillColor('#000');
+      }
       i++;
     }
     doc.end();
@@ -737,8 +880,11 @@ async function executeDelivery(params: {
   channel: 'email' | 'sms';
   recipients: Array<{ email?: string; phone?: string; name?: string }>;
   recipientListId?: string;
+  customSmsTemplate?: string; // optional template override with merge tags
+  customEmailSubject?: string;
+  customEmailBody?: string;
 }) {
-  const { batchId, channel, recipients, recipientListId } = params;
+  const { batchId, channel, recipients, recipientListId, customSmsTemplate, customEmailSubject, customEmailBody } = params;
   const batch = await prisma.distributionBatch.findUnique({ where: { id: batchId } });
   if (!batch) throw new HttpError(404, 'Batch not found.');
 
@@ -764,11 +910,23 @@ async function executeDelivery(params: {
 
   const { sendDistributionTicketEmail } = await import('../lib/email.js');
 
+  const venue = await prisma.venue.findUnique({ where: { id: batch.venueId } });
+
   for (let i = 0; i < recipients.length; i++) {
     const r = recipients[i];
     const t = tickets[i];
     const contact = (channel === 'email' ? r.email : r.phone) ?? '';
-    const url = `${APP_URL}/scratch/${t.id}`;
+    const longUrl = `${APP_URL}/scratch/${t.id}`;
+    const shortUrl = await getOrCreateShortUrl(longUrl);
+    const firstName = (r.name ?? '').trim().split(/\s+/)[0] ?? '';
+    const mergeVars = {
+      firstName,
+      name: r.name ?? '',
+      campaign: campaign?.name ?? 'Scratch Card',
+      venue: venue?.name ?? '',
+      url: shortUrl,
+      org: org?.name ?? 'ScratchPoker',
+    };
 
     // Create log row first
     const log = await prisma.deliveryLog.create({
@@ -782,16 +940,36 @@ async function executeDelivery(params: {
 
     try {
       if (channel === 'email') {
-        await sendDistributionTicketEmail({
-          toEmail: r.email ?? '',
-          toName: r.name ?? '',
-          scratchUrl: url,
-          campaignName: campaign?.name ?? 'Scratch Card',
-          orgName: org?.name ?? 'ScratchPoker',
-          orgLogo: org?.logoUrl ?? null,
-        });
+        // If custom subject/body provided, send directly with merge tags applied
+        if (customEmailSubject || customEmailBody) {
+          const sgKey = process.env.SENDGRID_API_KEY;
+          if (sgKey) {
+            const sgMail = (await import('@sendgrid/mail')).default;
+            sgMail.setApiKey(sgKey);
+            const FROM_EMAIL = process.env.FROM_EMAIL ?? 'noreply@scratchpoker.com';
+            const FROM_NAME = process.env.FROM_NAME ?? 'ScratchPoker';
+            await sgMail.send({
+              to: { email: r.email ?? '', name: r.name || (r.email ?? '') },
+              from: { email: FROM_EMAIL, name: org?.name ?? FROM_NAME },
+              subject: applyMergeTags(customEmailSubject ?? `🎴 You have a scratch ticket from ${org?.name ?? 'ScratchPoker'}!`, mergeVars),
+              html: applyMergeTags(customEmailBody ?? '', mergeVars),
+              text: applyMergeTags(customEmailBody ?? '', mergeVars).replace(/<[^>]+>/g, ''),
+            });
+          }
+        } else {
+          await sendDistributionTicketEmail({
+            toEmail: r.email ?? '',
+            toName: r.name ?? '',
+            scratchUrl: shortUrl,
+            campaignName: campaign?.name ?? 'Scratch Card',
+            orgName: org?.name ?? 'ScratchPoker',
+            orgLogo: org?.logoUrl ?? null,
+          });
+        }
       } else {
-        const msg = `${r.name ? r.name + ', here is' : 'Here is'} your scratch ticket: ${url} - ${campaign?.name ?? 'ScratchPoker'}`;
+        const defaultTpl = `{{firstName}}{{firstName? }}your scratch ticket: {{url}} - {{campaign}}`;
+        const tpl = customSmsTemplate ?? `${r.name ? r.name + ', here is' : 'Here is'} your scratch ticket: {{url}} - {{campaign}}`;
+        const msg = applyMergeTags(tpl, mergeVars);
         await twilioClient.messages.create({ to: r.phone!, from: process.env.TWILIO_PHONE_NUMBER!, body: msg });
       }
       await prisma.deliveryLog.update({
@@ -813,21 +991,22 @@ async function executeDelivery(params: {
 distributionRouter.post('/batches/:id/send-email', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
   try {
     const user = req.user!;
-    const { recipients, recipientListId, throttlePerMinute, delaySeconds } = req.body as {
+    const { recipients, recipientListId, throttlePerMinute, delaySeconds, customEmailSubject, customEmailBody } = req.body as {
       recipients: Array<{ email: string; name?: string }>;
       recipientListId?: string;
       throttlePerMinute?: number;
-      delaySeconds?: number; // for undo — schedule N seconds out
+      delaySeconds?: number;
+      customEmailSubject?: string;
+      customEmailBody?: string;
     };
     if (!Array.isArray(recipients) || recipients.length === 0) throw new HttpError(400, 'recipients required.');
 
-    // Schedule for later (undo window or throttling)
     if ((delaySeconds && delaySeconds > 0) || (throttlePerMinute && recipients.length > throttlePerMinute)) {
       const scheduledFor = new Date(Date.now() + (delaySeconds ?? 0) * 1000);
       const job = await prisma.scheduledDelivery.create({
         data: {
           batchId: req.params.id,
-          payload: JSON.stringify({ channel: 'email', recipients, recipientListId, throttlePerMinute }),
+          payload: JSON.stringify({ channel: 'email', recipients, recipientListId, throttlePerMinute, customEmailSubject, customEmailBody }),
           scheduledFor, createdBy: user.id, status: 'pending',
         },
       });
@@ -835,7 +1014,7 @@ distributionRouter.post('/batches/:id/send-email', requireAuth, requireRole('adm
       return;
     }
 
-    const result = await executeDelivery({ batchId: req.params.id, channel: 'email', recipients, recipientListId });
+    const result = await executeDelivery({ batchId: req.params.id, channel: 'email', recipients, recipientListId, customEmailSubject, customEmailBody });
     res.json(result);
   } catch (err: any) {
     if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
@@ -850,11 +1029,12 @@ distributionRouter.post('/batches/:id/send-sms', requireAuth, requireRole('admin
     if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
       throw new HttpError(503, 'SMS not configured.');
     }
-    const { recipients, recipientListId, throttlePerMinute, delaySeconds } = req.body as {
+    const { recipients, recipientListId, throttlePerMinute, delaySeconds, customSmsTemplate } = req.body as {
       recipients: Array<{ phone: string; name?: string }>;
       recipientListId?: string;
       throttlePerMinute?: number;
       delaySeconds?: number;
+      customSmsTemplate?: string;
     };
     if (!Array.isArray(recipients) || recipients.length === 0) throw new HttpError(400, 'recipients required.');
 
@@ -863,7 +1043,7 @@ distributionRouter.post('/batches/:id/send-sms', requireAuth, requireRole('admin
       const job = await prisma.scheduledDelivery.create({
         data: {
           batchId: req.params.id,
-          payload: JSON.stringify({ channel: 'sms', recipients, recipientListId, throttlePerMinute }),
+          payload: JSON.stringify({ channel: 'sms', recipients, recipientListId, throttlePerMinute, customSmsTemplate }),
           scheduledFor, createdBy: user.id, status: 'pending',
         },
       });
@@ -871,7 +1051,7 @@ distributionRouter.post('/batches/:id/send-sms', requireAuth, requireRole('admin
       return;
     }
 
-    const result = await executeDelivery({ batchId: req.params.id, channel: 'sms', recipients, recipientListId });
+    const result = await executeDelivery({ batchId: req.params.id, channel: 'sms', recipients, recipientListId, customSmsTemplate });
     res.json(result);
   } catch (err: any) {
     if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
@@ -1178,3 +1358,274 @@ distributionRouter.delete('/recipient-lists/:id', requireAuth, requireRole('admi
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// ── NOTES & TAGS (#2) ─────────────────────────────────────
+
+distributionRouter.post('/batches/:id/notes', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { notes } = req.body as { notes: string };
+    const batch = await prisma.distributionBatch.update({
+      where: { id: req.params.id },
+      data: { notes: notes ?? null },
+    });
+    res.json({ success: true, batch });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/batches/:id/tags', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { tags } = req.body as { tags: string[] };
+    if (!Array.isArray(tags)) throw new HttpError(400, 'tags must be an array.');
+    const cleanTags = tags.map(t => String(t).trim().toLowerCase()).filter(Boolean).slice(0, 20);
+    const batch = await prisma.distributionBatch.update({
+      where: { id: req.params.id },
+      data: { tags: JSON.stringify(cleanTags) },
+    });
+    res.json({ success: true, batch: { ...batch, tags: cleanTags } });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── ARCHIVE (#8) ──────────────────────────────────────────
+
+distributionRouter.post('/batches/:id/archive', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    await prisma.distributionBatch.update({
+      where: { id: req.params.id },
+      data: { archived: true, archivedAt: new Date() },
+    });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/batches/:id/unarchive', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    await prisma.distributionBatch.update({
+      where: { id: req.params.id },
+      data: { archived: false, archivedAt: null },
+    });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── COMPARE BATCHES (#3) ──────────────────────────────────
+
+distributionRouter.post('/batches/compare', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { batchIds } = req.body as { batchIds: string[] };
+    if (!Array.isArray(batchIds) || batchIds.length === 0 || batchIds.length > 5) {
+      throw new HttpError(400, 'batchIds must be an array of 1–5 IDs.');
+    }
+    const batches = await prisma.distributionBatch.findMany({ where: { id: { in: batchIds } } });
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: { in: batchIds } },
+      select: { distributionBatchId: true, status: true },
+    });
+    const logs = await prisma.deliveryLog.groupBy({
+      by: ['batchId', 'channel'],
+      where: { batchId: { in: batchIds } },
+      _count: { _all: true },
+    });
+    const campaigns = await prisma.campaign.findMany({ where: { id: { in: batches.map(b => b.campaignId) } } });
+    const venues = await prisma.venue.findMany({ where: { id: { in: batches.map(b => b.venueId) } } });
+
+    const result = batches.map(b => {
+      const bTickets = tickets.filter(t => t.distributionBatchId === b.id);
+      const stats = { issued: 0, in_progress: 0, finalized: 0, claimed: 0, redeemed: 0, frozen: 0 };
+      for (const t of bTickets) {
+        const s = (t.status === 'pending_staff_approval' || t.status === 'approved') ? 'claimed' : t.status;
+        (stats as any)[s] = ((stats as any)[s] ?? 0) + 1;
+      }
+      const bLogs = logs.filter(l => l.batchId === b.id);
+      const emailCount = bLogs.find(l => l.channel === 'email')?._count._all ?? 0;
+      const smsCount = bLogs.find(l => l.channel === 'sms')?._count._all ?? 0;
+      const finalized = stats.finalized + stats.claimed + stats.redeemed;
+      const conversionRate = b.quantity > 0 ? finalized / b.quantity : 0;
+      return {
+        batch: { ...b, tags: typeof b.tags === 'string' ? (() => { try { return JSON.parse(b.tags); } catch { return []; } })() : b.tags },
+        campaign: campaigns.find(c => c.id === b.campaignId),
+        venue: venues.find(v => v.id === b.venueId),
+        stats,
+        delivery: { emailCount, smsCount, costCents: Math.round(emailCount * 0.06 + smsCount * 0.75) },
+        conversionRate,
+      };
+    });
+
+    res.json({ batches: result });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[distribution] compare error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── EXPORT BATCH ANALYTICS CSV (#4) ───────────────────────
+
+distributionRouter.get('/batches/:id/analytics.csv', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    const tickets = await prisma.ticket.findMany({
+      where: { distributionBatchId: batch.id },
+      select: { id: true, status: true, isFrozen: true, lockedIp: true, createdAt: true, finalizedAt: true, claimSubmittedAt: true, prizeSnapshot: true },
+    });
+    const logs = await prisma.deliveryLog.findMany({
+      where: { batchId: batch.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+    const venue = await prisma.venue.findUnique({ where: { id: batch.venueId } });
+
+    const totals = {
+      issued: tickets.length,
+      scratched: tickets.filter(t => t.lockedIp).length,
+      finalized: tickets.filter(t => t.finalizedAt).length,
+      claimed: tickets.filter(t => t.claimSubmittedAt).length,
+    };
+    const conv = totals.issued > 0 ? (totals.finalized / totals.issued * 100).toFixed(1) : '0';
+
+    const rows: string[] = [];
+    rows.push('# Batch Analytics Export');
+    rows.push(`# Batch: ${batch.name}`);
+    rows.push(`# Campaign: ${campaign?.name ?? ''}`);
+    rows.push(`# Venue: ${venue?.name ?? ''}`);
+    rows.push(`# Issued: ${batch.issuedAt.toISOString()}`);
+    rows.push(`# Quantity: ${batch.quantity}`);
+    rows.push(`# Status: ${batch.status}`);
+    rows.push('');
+    rows.push('# Funnel');
+    rows.push(`Issued,${totals.issued}`);
+    rows.push(`Scratched (IP locked),${totals.scratched}`);
+    rows.push(`Finalized,${totals.finalized}`);
+    rows.push(`Claims submitted,${totals.claimed}`);
+    rows.push(`Conversion rate,${conv}%`);
+    rows.push('');
+    rows.push('# Delivery Log');
+    rows.push('createdAt,channel,recipientName,recipientContact,status,sentAt,openedAt,scratchedAt,errorMessage');
+    for (const l of logs) {
+      const cell = (v: any) => {
+        if (v == null) return '';
+        const s = String(v).replace(/"/g, '""');
+        return /[,\n"]/.test(s) ? `"${s}"` : s;
+      };
+      rows.push([
+        cell(l.createdAt.toISOString()), cell(l.channel), cell(l.recipientName),
+        cell(l.recipientContact), cell(l.status),
+        cell(l.sentAt?.toISOString() ?? ''), cell(l.openedAt?.toISOString() ?? ''),
+        cell(l.scratchedAt?.toISOString() ?? ''), cell(l.errorMessage ?? ''),
+      ].join(','));
+    }
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="batch-${batch.id}-analytics.csv"`);
+    res.send(rows.join('\n'));
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── FULFILLMENT LABELS (#10) ─────────────────────────────
+
+distributionRouter.get('/orgs/:orgId/fulfillment-claims', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const claims = await prisma.claim.findMany({
+      where: { orgId: req.params.orgId, status: { in: ['approved', 'redeemed'] } },
+      orderBy: { reviewedAt: 'desc' },
+      take: 500,
+    });
+    // Filter to only item prizes (prizeAmount = 0 or has shipping address)
+    const itemClaims = claims.filter(c => {
+      try {
+        const ps = typeof c.prizeSnapshot === 'string' ? JSON.parse(c.prizeSnapshot) : c.prizeSnapshot;
+        return ps?.prizeAmount === 0 || c.shippingAddress;
+      } catch { return false; }
+    });
+    res.json(itemClaims.map(c => ({
+      ...c,
+      prizeSnapshot: typeof c.prizeSnapshot === 'string' ? JSON.parse(c.prizeSnapshot) : c.prizeSnapshot,
+      shippingAddress: c.shippingAddress ? JSON.parse(c.shippingAddress) : null,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/claims/:id/shipping-address', requireAuth, requireRole('staff', 'admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { street, city, state, zip, country } = req.body;
+    const addr = JSON.stringify({ street, city, state, zip, country: country ?? 'US' });
+    const claim = await prisma.claim.update({
+      where: { id: req.params.id },
+      data: { shippingAddress: addr },
+    });
+    res.json({ success: true, claim });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.get('/fulfillment-labels.pdf', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const PDFDocument = (await import('pdfkit')).default;
+    const { claimIds } = req.query as Record<string, string>;
+    if (!claimIds) throw new HttpError(400, 'claimIds required (comma-separated).');
+    const ids = claimIds.split(',').map(s => s.trim()).filter(Boolean);
+    const claims = await prisma.claim.findMany({ where: { id: { in: ids } } });
+
+    const doc = new PDFDocument({ size: 'LETTER', margin: 36 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="fulfillment-labels.pdf"`);
+    doc.pipe(res);
+
+    // Avery 5163 layout: 2 cols x 5 rows, 4"x2" labels
+    const cellW = 4 * 72;
+    const cellH = 2 * 72;
+    const startX = (612 - 2 * cellW) / 2;
+    const startY = 36;
+
+    let i = 0;
+    for (const claim of claims) {
+      const idx = i % 10;
+      const col = idx % 2;
+      const row = Math.floor(idx / 2);
+      if (i > 0 && idx === 0) doc.addPage();
+      const x = startX + col * cellW;
+      const y = startY + row * cellH;
+
+      doc.rect(x + 4, y + 4, cellW - 8, cellH - 8).stroke('#cccccc');
+
+      const ps = typeof claim.prizeSnapshot === 'string' ? JSON.parse(claim.prizeSnapshot) : claim.prizeSnapshot;
+      const addr = claim.shippingAddress ? JSON.parse(claim.shippingAddress) : null;
+
+      doc.fontSize(10).font('Helvetica-Bold').text(claim.playerName ?? 'Unknown', x + 12, y + 12, { width: cellW - 24 });
+      if (addr) {
+        doc.fontSize(8).font('Helvetica').text(addr.street ?? '', x + 12, y + 28, { width: cellW - 24 });
+        doc.text(`${addr.city ?? ''}, ${addr.state ?? ''} ${addr.zip ?? ''}`, x + 12, y + 40, { width: cellW - 24 });
+        doc.text(addr.country ?? '', x + 12, y + 52, { width: cellW - 24 });
+      } else {
+        doc.fontSize(8).fillColor('#888').text('No shipping address', x + 12, y + 28);
+        doc.fillColor('#000');
+      }
+      doc.fontSize(7).fillColor('#666').text(`Prize: ${ps?.prizeLabel ?? ''}`, x + 12, y + 80, { width: cellW - 24 });
+      doc.text(`Claim: ${claim.id.slice(0, 12)}`, x + 12, y + 92, { width: cellW - 24 });
+      doc.fillColor('#000');
+      i++;
+    }
+    doc.end();
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Export helpers for other modules
+export { getOrCreateShortUrl, applyMergeTags };

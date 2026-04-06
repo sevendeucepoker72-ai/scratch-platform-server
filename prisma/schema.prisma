@@ -285,6 +285,7 @@ model Claim {
   playerEmail   String?
   playerName    String?
   playerPhone   String?
+  shippingAddress String? // JSON: { street, city, state, zip, country }
   submittedAt   DateTime @default(now())
   reviewedAt    DateTime?
   reviewedBy    String?
@@ -580,6 +581,7 @@ model DistributionBatch {
   name          String
   quantity      Int
   onePerIp      Boolean   @default(false)
+  activatesAt   DateTime?
   expiresAt     DateTime?
   scheduledFor  DateTime?
   issuedBy      String
@@ -588,10 +590,24 @@ model DistributionBatch {
   voidedBy      String?
   status        String    @default("active") // active, voided, expired, scheduled
   notes         String?
+  tags          String    @default("[]") // JSON array of tag strings
+  archived      Boolean   @default(false)
+  archivedAt    DateTime?
 
   @@index([campaignId])
   @@index([orgId, issuedAt])
+  @@index([archived])
   @@map("distribution_batches")
+}
+
+model ShortUrl {
+  id         String   @id // short code (6-char base62)
+  targetUrl  String
+  createdAt  DateTime @default(now())
+  hitCount   Int      @default(0)
+
+  @@index([targetUrl])
+  @@map("short_urls")
 }
 
 model RecipientList {
