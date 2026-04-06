@@ -714,3 +714,159 @@ model IdempotencyKey {
 
   @@map("idempotency_keys")
 }
+
+// ── Distribution Phase 3 ────────────────────────────────────
+
+model SuppressionEntry {
+  id        String   @id @default(cuid())
+  orgId     String
+  channel   String   // email, sms
+  value     String   // email or phone (lowercased)
+  reason    String   // unsubscribe, bounce, complaint, manual
+  createdAt DateTime @default(now())
+  @@unique([orgId, channel, value])
+  @@index([orgId])
+  @@map("suppression_entries")
+}
+
+model UnsubscribeToken {
+  id        String   @id @default(cuid()) // token
+  orgId     String
+  channel   String
+  value     String
+  createdAt DateTime @default(now())
+  usedAt    DateTime?
+  @@index([orgId])
+  @@map("unsubscribe_tokens")
+}
+
+model BatchSchedule {
+  id          String   @id @default(cuid())
+  orgId       String
+  batchId     String?
+  campaignId  String
+  venueId     String
+  quantity    Int
+  channel     String   // email, sms
+  recipients  String   // JSON array
+  templateSubject String?
+  templateBody    String?
+  smsBody         String?
+  scheduledFor    DateTime
+  status      String   @default("scheduled") // scheduled, processing, sent, failed, cancelled
+  createdBy   String
+  createdAt   DateTime @default(now())
+  executedAt  DateTime?
+  error       String?
+  @@index([status, scheduledFor])
+  @@map("batch_schedules")
+}
+
+model DripSequence {
+  id            String   @id @default(cuid())
+  batchId       String
+  step          Int      // 1, 2, 3
+  delayHours    Int      // 24, 72, 168
+  channel       String
+  subject       String?
+  body          String
+  status        String   @default("pending") // pending, sent, cancelled
+  scheduledFor  DateTime
+  createdAt     DateTime @default(now())
+  @@index([status, scheduledFor])
+  @@index([batchId])
+  @@map("drip_sequences")
+}
+
+model BatchApproval {
+  id           String   @id @default(cuid())
+  orgId        String
+  requestedBy  String
+  campaignId   String
+  venueId      String
+  quantity     Int
+  estimatedCostCents Int
+  payload      String   // JSON of full issue request
+  status       String   @default("pending") // pending, approved, rejected
+  reviewedBy   String?
+  reviewedAt   DateTime?
+  rejectionReason String?
+  createdAt    DateTime @default(now())
+  @@index([orgId, status])
+  @@map("batch_approvals")
+}
+
+model RevenueAttribution {
+  id            String   @id @default(cuid())
+  batchId       String
+  ticketId      String
+  claimId       String?
+  payoutCents   Int      @default(0)
+  recordedAt    DateTime @default(now())
+  @@index([batchId])
+  @@map("revenue_attribution")
+}
+
+model AbTestVariant {
+  id        String   @id @default(cuid())
+  batchId   String
+  label     String   // A, B
+  subject   String
+  body      String?
+  sent      Int      @default(0)
+  opened    Int      @default(0)
+  scratched Int      @default(0)
+  isWinner  Boolean  @default(false)
+  @@index([batchId])
+  @@map("ab_test_variants")
+}
+
+model AgeGateRecord {
+  id        String   @id @default(cuid())
+  ticketId  String   @unique
+  dob       String   // ISO date
+  confirmed Boolean  @default(true)
+  ip        String?
+  createdAt DateTime @default(now())
+  @@map("age_gate_records")
+}
+
+model OrgGeoFence {
+  id           String  @id @default(cuid())
+  orgId        String  @unique
+  blockedCodes String  @default("[]") // JSON array of country/region codes
+  mode         String  @default("block") // block or allow
+  @@map("org_geofences")
+}
+
+model GeoEvent {
+  id        String   @id @default(cuid())
+  ticketId  String
+  batchId   String?
+  ip        String
+  country   String?
+  region    String?
+  city      String?
+  createdAt DateTime @default(now())
+  @@index([batchId])
+  @@map("geo_events")
+}
+
+model RetentionPolicy {
+  id        String   @id @default(cuid())
+  orgId     String   @unique
+  ttlDays   Int      @default(365)
+  updatedAt DateTime @updatedAt
+  @@map("retention_policies")
+}
+
+model EmbedToken {
+  id        String   @id @default(cuid())
+  orgId     String
+  campaignId String
+  domain    String?
+  createdAt DateTime @default(now())
+  hits      Int      @default(0)
+  @@index([orgId])
+  @@map("embed_tokens")
+}
