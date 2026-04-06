@@ -594,6 +594,58 @@ model DistributionBatch {
   @@map("distribution_batches")
 }
 
+model RecipientList {
+  id          String   @id @default(cuid())
+  orgId       String
+  name        String
+  description String?
+  recipients  String   @default("[]") // JSON: [{ name, email, phone }]
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([orgId])
+  @@map("recipient_lists")
+}
+
+model DeliveryLog {
+  id                String    @id @default(cuid())
+  batchId           String
+  ticketId          String
+  channel           String    // "email" | "sms"
+  recipientName     String?
+  recipientContact  String    // email or phone
+  recipientListId   String?   // optional reference to a saved list
+  status            String    // queued, sent, delivered, failed, bounced, opened, scratched
+  errorMessage      String?
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+  openedAt          DateTime?
+  scratchedAt       DateTime?
+  reminderSentAt    DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([batchId])
+  @@index([ticketId])
+  @@index([recipientContact])
+  @@index([status])
+  @@map("delivery_logs")
+}
+
+model ScheduledDelivery {
+  id            String   @id @default(cuid())
+  batchId       String
+  payload       String   // JSON: { recipients, channel, throttleRate, rendered }
+  scheduledFor  DateTime
+  status        String   @default("pending") // pending, running, done, cancelled
+  createdBy     String
+  createdAt     DateTime @default(now())
+  cancelledAt   DateTime?
+
+  @@index([status, scheduledFor])
+  @@map("scheduled_deliveries")
+}
+
 model DistributionTemplate {
   id          String   @id @default(cuid())
   orgId       String

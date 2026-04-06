@@ -1,7 +1,114 @@
 import cron from 'node-cron';
 import { prisma } from '../db.js';
+import { executeDelivery } from '../routes/distribution.js';
 
 export function startScheduledJobs() {
+  // Dispatch scheduled deliveries (undo timers + throttled batches) — every minute
+  cron.schedule('* * * * *', async () => {
+    try {
+      const now = new Date();
+      const pending = await prisma.scheduledDelivery.findMany({
+        where: { status: 'pending', scheduledFor: { lte: now } },
+        take: 20,
+      });
+      for (const job of pending) {
+        try {
+          await prisma.scheduledDelivery.update({
+            where: { id: job.id }, data: { status: 'running' },
+          });
+          const payload = JSON.parse(job.payload);
+          const throttle = payload.throttlePerMinute as number | undefined;
+          const recipients = payload.recipients as Array<any>;
+
+          if (throttle && recipients.length > throttle) {
+            // Send first `throttle` recipients now, reschedule the rest for 1 min later
+            const thisBatch = recipients.slice(0, throttle);
+            const remaining = recipients.slice(throttle);
+            await executeDelivery({
+              batchId: job.batchId,
+              channel: payload.channel,
+              recipients: thisBatch,
+              recipientListId: payload.recipientListId,
+            });
+            if (remaining.length > 0) {
+              await prisma.scheduledDelivery.create({
+                data: {
+                  batchId: job.batchId,
+                  payload: JSON.stringify({ ...payload, recipients: remaining }),
+                  scheduledFor: new Date(now.getTime() + 60 * 1000),
+                  createdBy: job.createdBy,
+                  status: 'pending',
+                },
+              });
+            }
+          } else {
+            await executeDelivery({
+              batchId: job.batchId,
+              channel: payload.channel,
+              recipients,
+              recipientListId: payload.recipientListId,
+            });
+          }
+
+          await prisma.scheduledDelivery.update({
+            where: { id: job.id }, data: { status: 'done' },
+          });
+        } catch (err) {
+          console.error('[scheduled] delivery job failed:', err);
+          await prisma.scheduledDelivery.update({
+            where: { id: job.id }, data: { status: 'done' }, // mark done to avoid retry loop
+          }).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error('[scheduled] dispatchDeliveries error:', err);
+    }
+  });
+
+  // Send reminder emails — every hour
+  cron.schedule('15 * * * *', async () => {
+    try {
+      const { sendDistributionTicketEmail } = await import('../lib/email.js');
+      const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000); // 72h ago
+      const candidates = await prisma.deliveryLog.findMany({
+        where: {
+          channel: 'email',
+          sentAt: { lt: cutoff },
+          scratchedAt: null,
+          reminderSentAt: null,
+          status: { in: ['sent', 'delivered', 'opened'] },
+        },
+        take: 100,
+      });
+      if (candidates.length === 0) return;
+
+      for (const log of candidates) {
+        const batch = await prisma.distributionBatch.findUnique({ where: { id: log.batchId } });
+        if (!batch) continue;
+        const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+        const org = batch.orgId ? await prisma.organization.findUnique({ where: { id: batch.orgId } }) : null;
+        const url = `${process.env.APP_URL ?? 'http://localhost:5173'}/scratch/${log.ticketId}`;
+        try {
+          await sendDistributionTicketEmail({
+            toEmail: log.recipientContact,
+            toName: log.recipientName ?? '',
+            scratchUrl: url,
+            campaignName: `Reminder: ${campaign?.name ?? 'Scratch Card'}`,
+            orgName: org?.name ?? 'ScratchPoker',
+            orgLogo: org?.logoUrl ?? null,
+          });
+          await prisma.deliveryLog.update({
+            where: { id: log.id },
+            data: { reminderSentAt: new Date() },
+          });
+        } catch { /* ignore individual failures */ }
+      }
+      console.log(`[scheduled] Sent ${candidates.length} reminder emails`);
+    } catch (err) {
+      console.error('[scheduled] reminders error:', err);
+    }
+  });
+
   // Expire batches whose expiresAt has passed — every 5 minutes
   cron.schedule('*/5 * * * *', async () => {
     try {

@@ -171,6 +171,14 @@ distributionRouter.post('/public-ticket', async (req: Request, res: Response) =>
     if (!ticket) throw new HttpError(404, 'Ticket not found.');
     if (!ticket.distributionBatch) throw new HttpError(403, 'Not a distribution ticket.');
 
+    // Delivery tracking: mark as opened/scratched when ticket is loaded
+    if (ticket.distributionBatchId) {
+      void prisma.deliveryLog.updateMany({
+        where: { ticketId: ticket.id, openedAt: null },
+        data: { openedAt: new Date(), status: 'opened' },
+      }).catch(() => {});
+    }
+
     const revealedCardIds = (typeof ticket.revealedCardIds === 'string' ? JSON.parse(ticket.revealedCardIds) : ticket.revealedCardIds) as string[];
 
     const deck = (typeof ticket.deck === 'string' ? JSON.parse(ticket.deck) : ticket.deck) as string[];
@@ -332,6 +340,14 @@ distributionRouter.post('/public-reveal', async (req: Request, res: Response) =>
     if (ticket.isFrozen) throw new HttpError(403, 'Ticket is frozen.');
     if (ticket.status === 'finalized' || ticket.status === 'claimed' || ticket.status === 'expired') {
       throw new HttpError(400, `Ticket is already ${ticket.status}.`);
+    }
+
+    // Delivery tracking: mark as scratched on first reveal
+    if (ticket.distributionBatchId) {
+      void prisma.deliveryLog.updateMany({
+        where: { ticketId: ticket.id, scratchedAt: null },
+        data: { scratchedAt: new Date(), status: 'scratched' },
+      }).catch(() => {});
     }
 
     // IP lock: bind ticket to first player's IP (atomic to prevent race condition)
@@ -715,38 +731,112 @@ distributionRouter.get('/batches/:id/pdf', requireAuth, async (req: Request, res
   }
 });
 
-distributionRouter.post('/batches/:id/send-email', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
-  try {
-    const { sendDistributionTicketEmail } = await import('../lib/email.js');
-    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
-    if (!batch) throw new HttpError(404, 'Batch not found.');
-    const { recipients } = req.body as { recipients: Array<{ email: string; name?: string }> };
-    if (!Array.isArray(recipients) || recipients.length === 0) throw new HttpError(400, 'recipients required.');
+// Shared executor for email/SMS sends. Creates DeliveryLog rows + throttles.
+async function executeDelivery(params: {
+  batchId: string;
+  channel: 'email' | 'sms';
+  recipients: Array<{ email?: string; phone?: string; name?: string }>;
+  recipientListId?: string;
+}) {
+  const { batchId, channel, recipients, recipientListId } = params;
+  const batch = await prisma.distributionBatch.findUnique({ where: { id: batchId } });
+  if (!batch) throw new HttpError(404, 'Batch not found.');
 
-    const tickets = await prisma.ticket.findMany({
-      where: { distributionBatchId: batch.id, status: 'issued', isFrozen: false },
-      select: { id: true }, orderBy: { createdAt: 'asc' }, take: recipients.length,
+  const tickets = await prisma.ticket.findMany({
+    where: { distributionBatchId: batch.id, status: 'issued', isFrozen: false },
+    select: { id: true }, orderBy: { createdAt: 'asc' }, take: recipients.length,
+  });
+  if (tickets.length < recipients.length) {
+    throw new HttpError(400, `Only ${tickets.length} unscratched tickets available.`);
+  }
+
+  const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+  const org = batch.orgId ? await prisma.organization.findUnique({ where: { id: batch.orgId } }) : null;
+
+  let sent = 0, failed = 0;
+  let twilioClient: any = null;
+  if (channel === 'sms') {
+    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
+      throw new HttpError(503, 'SMS not configured.');
+    }
+    twilioClient = (await import('twilio')).default(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  }
+
+  const { sendDistributionTicketEmail } = await import('../lib/email.js');
+
+  for (let i = 0; i < recipients.length; i++) {
+    const r = recipients[i];
+    const t = tickets[i];
+    const contact = (channel === 'email' ? r.email : r.phone) ?? '';
+    const url = `${APP_URL}/scratch/${t.id}`;
+
+    // Create log row first
+    const log = await prisma.deliveryLog.create({
+      data: {
+        batchId: batch.id, ticketId: t.id, channel,
+        recipientName: r.name ?? null, recipientContact: contact,
+        recipientListId: recipientListId ?? null,
+        status: 'queued',
+      },
     });
-    if (tickets.length < recipients.length) throw new HttpError(400, `Only ${tickets.length} unscratched tickets available.`);
 
-    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
-    const org = batch.orgId ? await prisma.organization.findUnique({ where: { id: batch.orgId } }) : null;
-
-    let sent = 0, failed = 0;
-    for (let i = 0; i < recipients.length; i++) {
-      try {
+    try {
+      if (channel === 'email') {
         await sendDistributionTicketEmail({
-          toEmail: recipients[i].email,
-          toName: recipients[i].name ?? '',
-          scratchUrl: `${APP_URL}/scratch/${tickets[i].id}`,
+          toEmail: r.email ?? '',
+          toName: r.name ?? '',
+          scratchUrl: url,
           campaignName: campaign?.name ?? 'Scratch Card',
           orgName: org?.name ?? 'ScratchPoker',
           orgLogo: org?.logoUrl ?? null,
         });
-        sent++;
-      } catch { failed++; }
+      } else {
+        const msg = `${r.name ? r.name + ', here is' : 'Here is'} your scratch ticket: ${url} - ${campaign?.name ?? 'ScratchPoker'}`;
+        await twilioClient.messages.create({ to: r.phone!, from: process.env.TWILIO_PHONE_NUMBER!, body: msg });
+      }
+      await prisma.deliveryLog.update({
+        where: { id: log.id },
+        data: { status: 'sent', sentAt: new Date() },
+      });
+      sent++;
+    } catch (err: any) {
+      await prisma.deliveryLog.update({
+        where: { id: log.id },
+        data: { status: 'failed', errorMessage: (err?.message ?? String(err)).slice(0, 500) },
+      });
+      failed++;
     }
-    res.json({ sent, failed, total: recipients.length });
+  }
+  return { sent, failed, total: recipients.length };
+}
+
+distributionRouter.post('/batches/:id/send-email', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { recipients, recipientListId, throttlePerMinute, delaySeconds } = req.body as {
+      recipients: Array<{ email: string; name?: string }>;
+      recipientListId?: string;
+      throttlePerMinute?: number;
+      delaySeconds?: number; // for undo — schedule N seconds out
+    };
+    if (!Array.isArray(recipients) || recipients.length === 0) throw new HttpError(400, 'recipients required.');
+
+    // Schedule for later (undo window or throttling)
+    if ((delaySeconds && delaySeconds > 0) || (throttlePerMinute && recipients.length > throttlePerMinute)) {
+      const scheduledFor = new Date(Date.now() + (delaySeconds ?? 0) * 1000);
+      const job = await prisma.scheduledDelivery.create({
+        data: {
+          batchId: req.params.id,
+          payload: JSON.stringify({ channel: 'email', recipients, recipientListId, throttlePerMinute }),
+          scheduledFor, createdBy: user.id, status: 'pending',
+        },
+      });
+      res.json({ scheduled: true, jobId: job.id, scheduledFor, total: recipients.length });
+      return;
+    }
+
+    const result = await executeDelivery({ batchId: req.params.id, channel: 'email', recipients, recipientListId });
+    res.json(result);
   } catch (err: any) {
     if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
     console.error('[distribution] send-email error:', err);
@@ -756,38 +846,42 @@ distributionRouter.post('/batches/:id/send-email', requireAuth, requireRole('adm
 
 distributionRouter.post('/batches/:id/send-sms', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
   try {
+    const user = req.user!;
     if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
-      throw new HttpError(503, 'SMS not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.');
+      throw new HttpError(503, 'SMS not configured.');
     }
-    const twilio = (await import('twilio')).default(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
-    if (!batch) throw new HttpError(404, 'Batch not found.');
-    const { recipients } = req.body as { recipients: Array<{ phone: string; name?: string }> };
+    const { recipients, recipientListId, throttlePerMinute, delaySeconds } = req.body as {
+      recipients: Array<{ phone: string; name?: string }>;
+      recipientListId?: string;
+      throttlePerMinute?: number;
+      delaySeconds?: number;
+    };
     if (!Array.isArray(recipients) || recipients.length === 0) throw new HttpError(400, 'recipients required.');
 
-    const tickets = await prisma.ticket.findMany({
-      where: { distributionBatchId: batch.id, status: 'issued', isFrozen: false },
-      select: { id: true }, orderBy: { createdAt: 'asc' }, take: recipients.length,
-    });
-    if (tickets.length < recipients.length) throw new HttpError(400, `Only ${tickets.length} unscratched tickets available.`);
-    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
-
-    let sent = 0, failed = 0;
-    for (let i = 0; i < recipients.length; i++) {
-      const url = `${APP_URL}/scratch/${tickets[i].id}`;
-      const msg = `${recipients[i].name ? recipients[i].name + ', here is' : 'Here is'} your scratch ticket: ${url} - ${campaign?.name ?? 'ScratchPoker'}`;
-      try {
-        await twilio.messages.create({ to: recipients[i].phone, from: process.env.TWILIO_PHONE_NUMBER!, body: msg });
-        sent++;
-      } catch { failed++; }
+    if ((delaySeconds && delaySeconds > 0) || (throttlePerMinute && recipients.length > throttlePerMinute)) {
+      const scheduledFor = new Date(Date.now() + (delaySeconds ?? 0) * 1000);
+      const job = await prisma.scheduledDelivery.create({
+        data: {
+          batchId: req.params.id,
+          payload: JSON.stringify({ channel: 'sms', recipients, recipientListId, throttlePerMinute }),
+          scheduledFor, createdBy: user.id, status: 'pending',
+        },
+      });
+      res.json({ scheduled: true, jobId: job.id, scheduledFor, total: recipients.length });
+      return;
     }
-    res.json({ sent, failed, total: recipients.length });
+
+    const result = await executeDelivery({ batchId: req.params.id, channel: 'sms', recipients, recipientListId });
+    res.json(result);
   } catch (err: any) {
     if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
     console.error('[distribution] send-sms error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Export for cron jobs
+export { executeDelivery };
 
 // ── DISTRIBUTION TEMPLATES ────────────────────────────────
 
@@ -830,6 +924,257 @@ distributionRouter.delete('/templates/:id', requireAuth, requireRole('admin', 's
     await prisma.distributionTemplate.delete({ where: { id: req.params.id } });
     res.json({ success: true });
   } catch {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── DELIVERY TRACKING, PREVIEW, UNDO, RESEND ─────────────
+
+// POST /batches/:id/send-preview — returns rendered content without sending
+distributionRouter.post('/batches/:id/send-preview', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+    const { channel, recipient } = req.body as { channel: 'email' | 'sms'; recipient?: { email?: string; phone?: string; name?: string } };
+
+    const campaign = await prisma.campaign.findUnique({ where: { id: batch.campaignId } });
+    const org = batch.orgId ? await prisma.organization.findUnique({ where: { id: batch.orgId } }) : null;
+    const exampleUrl = `${APP_URL}/scratch/EXAMPLE`;
+    const name = recipient?.name ?? 'Alice';
+
+    if (channel === 'sms') {
+      const msg = `${name ? name + ', here is' : 'Here is'} your scratch ticket: ${exampleUrl} - ${campaign?.name ?? 'ScratchPoker'}`;
+      res.json({ channel: 'sms', preview: msg, charCount: msg.length });
+      return;
+    }
+
+    // Email preview — render the full HTML
+    const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+      ${org?.logoUrl ? `<div style="text-align:center;margin-bottom:16px"><img src="${org.logoUrl}" alt="${org.name}" style="max-height:60px"/></div>` : ''}
+      <h2 style="text-align:center">You have a scratch ticket!</h2>
+      <p>Hi ${name},</p>
+      <p><strong>${org?.name ?? 'ScratchPoker'}</strong> sent you a scratch ticket for <strong>${campaign?.name ?? 'Scratch Card'}</strong>.</p>
+      <p>Tap the button below to scratch your card and see if you've won!</p>
+      <div style="text-align:center;margin:32px 0">
+        <a href="${exampleUrl}" style="display:inline-block;background:#3fb950;color:#000;padding:16px 36px;border-radius:8px;font-weight:700;text-decoration:none;font-size:18px">
+          🎴 Scratch Your Card
+        </a>
+      </div>
+      <p style="font-size:12px;color:#666">This ticket is one-time use. Don't share the link.</p>
+    </div>`;
+    res.json({
+      channel: 'email',
+      subject: `🎴 You have a scratch ticket from ${org?.name ?? 'ScratchPoker'}!`,
+      html,
+      text: `Hi ${name},\n\n${org?.name ?? 'ScratchPoker'} sent you a scratch ticket for ${campaign?.name ?? 'Scratch Card'}.\n\nTap to play: ${exampleUrl}\n\nThis ticket is one-time use - don't share the link.`,
+    });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /delivery-jobs/:id/cancel — cancel a scheduled send (undo)
+distributionRouter.post('/delivery-jobs/:id/cancel', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const job = await prisma.scheduledDelivery.findUnique({ where: { id: req.params.id } });
+    if (!job) throw new HttpError(404, 'Job not found.');
+    if (job.status !== 'pending') throw new HttpError(400, `Cannot cancel job in status: ${job.status}`);
+    await prisma.scheduledDelivery.update({
+      where: { id: req.params.id },
+      data: { status: 'cancelled', cancelledAt: new Date() },
+    });
+    res.json({ success: true });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /batches/:id/send-to-failed — resend to recipients that failed or bounced
+distributionRouter.post('/batches/:id/send-to-failed', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const batch = await prisma.distributionBatch.findUnique({ where: { id: req.params.id } });
+    if (!batch) throw new HttpError(404, 'Batch not found.');
+
+    const failedLogs = await prisma.deliveryLog.findMany({
+      where: { batchId: batch.id, status: { in: ['failed', 'bounced'] } },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Dedupe by recipientContact — keep most recent
+    const seen = new Set<string>();
+    const uniqueFailed = failedLogs.filter(log => {
+      if (seen.has(log.recipientContact)) return false;
+      seen.add(log.recipientContact);
+      return true;
+    });
+
+    if (uniqueFailed.length === 0) {
+      res.json({ sent: 0, failed: 0, total: 0, message: 'No failed deliveries to resend.' });
+      return;
+    }
+
+    // Group by channel
+    const emailRecipients = uniqueFailed
+      .filter(l => l.channel === 'email')
+      .map(l => ({ email: l.recipientContact, name: l.recipientName ?? undefined }));
+    const smsRecipients = uniqueFailed
+      .filter(l => l.channel === 'sms')
+      .map(l => ({ phone: l.recipientContact, name: l.recipientName ?? undefined }));
+
+    let totalSent = 0, totalFailed = 0;
+    if (emailRecipients.length > 0) {
+      const r = await executeDelivery({ batchId: batch.id, channel: 'email', recipients: emailRecipients });
+      totalSent += r.sent; totalFailed += r.failed;
+    }
+    if (smsRecipients.length > 0 && process.env.TWILIO_ACCOUNT_SID) {
+      const r = await executeDelivery({ batchId: batch.id, channel: 'sms', recipients: smsRecipients });
+      totalSent += r.sent; totalFailed += r.failed;
+    }
+    res.json({ sent: totalSent, failed: totalFailed, total: uniqueFailed.length });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    console.error('[distribution] resend-failed error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /batches/:id/delivery-log — list all delivery attempts for a batch
+distributionRouter.get('/batches/:id/delivery-log', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const logs = await prisma.deliveryLog.findMany({
+      where: { batchId: req.params.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(logs);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /check-duplicates — check for duplicates in a recipient list + already-sent
+distributionRouter.post('/check-duplicates', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { campaignId, channel, recipients } = req.body as {
+      campaignId?: string;
+      channel: 'email' | 'sms';
+      recipients: Array<{ email?: string; phone?: string; name?: string }>;
+    };
+
+    // Find duplicates within the list itself
+    const seen = new Set<string>();
+    const dupes: string[] = [];
+    for (const r of recipients) {
+      const contact = (channel === 'email' ? r.email : r.phone)?.toLowerCase().trim();
+      if (!contact) continue;
+      if (seen.has(contact)) dupes.push(contact);
+      else seen.add(contact);
+    }
+
+    // Find recipients who already got a ticket from this campaign
+    let alreadySent: string[] = [];
+    if (campaignId) {
+      const contacts = Array.from(seen);
+      const prior = await prisma.deliveryLog.findMany({
+        where: {
+          channel,
+          recipientContact: { in: contacts },
+          status: { in: ['sent', 'delivered', 'opened', 'scratched'] },
+          batchId: { in: (await prisma.distributionBatch.findMany({ where: { campaignId }, select: { id: true } })).map(b => b.id) },
+        },
+        select: { recipientContact: true },
+      });
+      alreadySent = [...new Set(prior.map(p => p.recipientContact))];
+    }
+
+    res.json({ duplicates: dupes, alreadySent });
+  } catch (err: any) {
+    console.error('[distribution] check-duplicates error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── RECIPIENT LISTS CRUD ──────────────────────────────────
+
+distributionRouter.get('/recipient-lists', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { orgId } = req.query as Record<string, string>;
+    const finalOrgId = orgId ?? user.orgId;
+    if (!finalOrgId) { res.json([]); return; }
+    const lists = await prisma.recipientList.findMany({
+      where: { orgId: finalOrgId }, orderBy: { updatedAt: 'desc' },
+    });
+    res.json(lists.map(l => ({
+      ...l,
+      recipients: typeof l.recipients === 'string' ? JSON.parse(l.recipients) : l.recipients,
+      recipientCount: (typeof l.recipients === 'string' ? JSON.parse(l.recipients) : l.recipients).length,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.get('/recipient-lists/:id', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const list = await prisma.recipientList.findUnique({ where: { id: req.params.id } });
+    if (!list) throw new HttpError(404, 'List not found.');
+    res.json({
+      ...list,
+      recipients: typeof list.recipients === 'string' ? JSON.parse(list.recipients) : list.recipients,
+    });
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.post('/recipient-lists', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const user = req.user!;
+    const { name, description, recipients, orgId } = req.body as {
+      name: string; description?: string; recipients: any[]; orgId?: string;
+    };
+    if (!name || !name.trim()) throw new HttpError(400, 'name required.');
+    if (!Array.isArray(recipients)) throw new HttpError(400, 'recipients must be an array.');
+    const list = await prisma.recipientList.create({
+      data: {
+        orgId: orgId ?? user.orgId ?? '',
+        name: name.trim(),
+        description: description ?? null,
+        recipients: JSON.stringify(recipients),
+        createdBy: user.id,
+      },
+    });
+    res.json(list);
+  } catch (err: any) {
+    if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.put('/recipient-lists/:id', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    const { name, description, recipients } = req.body as {
+      name?: string; description?: string; recipients?: any[];
+    };
+    const data: any = {};
+    if (name !== undefined) data.name = name;
+    if (description !== undefined) data.description = description;
+    if (recipients !== undefined) data.recipients = JSON.stringify(recipients);
+    const list = await prisma.recipientList.update({ where: { id: req.params.id }, data });
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+distributionRouter.delete('/recipient-lists/:id', requireAuth, requireRole('admin', 'super_admin'), async (req: Request, res: Response) => {
+  try {
+    await prisma.recipientList.delete({ where: { id: req.params.id } });
+    res.json({ success: true });
+  } catch (err: any) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
