@@ -122,6 +122,19 @@ queryRouter.get('/claims', requireAuth, async (req, res) => {
 
 // ── Drawing entries — claims qualifying for monthly drawing ──
 
+// ── Pending claims count (for notification bell) ──
+
+queryRouter.get('/claims-count', requireAuth, async (req, res) => {
+  try {
+    const count = await prisma.claim.count({
+      where: { status: 'pending_staff_approval' },
+    });
+    res.json({ count });
+  } catch {
+    res.json({ count: 0 });
+  }
+});
+
 queryRouter.get('/drawing-entries', requireAuth, async (req, res) => {
   try {
     const { campaignId } = req.query as Record<string, string>;
