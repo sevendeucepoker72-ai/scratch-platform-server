@@ -513,7 +513,9 @@ distributionRouter.post('/public-finalize', async (req: Request, res: Response) 
     });
 
     // For poker_pick: include full deck so frontend can reveal all 52 cards after finalize
-    const fullDeck = gameType === 'poker_pick' ? deck : undefined;
+    const fullDeck = gameType === 'poker_pick'
+      ? (typeof ticket.deck === 'string' ? JSON.parse(ticket.deck) : ticket.deck) as string[]
+      : undefined;
     res.json({ ticketId: validId, prizeSnapshot, fullDeck });
   } catch (err) {
     if (err instanceof HttpError) {
